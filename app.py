@@ -25,7 +25,7 @@ st.set_page_config(
 # 用于快速映射字段
 MODEL_FAST = "gemini-2.0-flash"        
 # 用于复杂模糊匹配 (推理能力强)
-MODEL_SMART = "gemini-3-pro-preview" 
+MODEL_SMART = "gemini-2.0-flash"  # 注意：如果你的API不支持pro-preview，这里用flash代替，或改回 gemini-1.5-pro
 
 # --- 常量定义 (模拟主数据库) ---
 # 假设这是你的标准主数据文件，包含标准医院名称、编码、地址等
@@ -41,7 +41,7 @@ try:
 except:
     FIXED_API_KEY = "" 
 
-# ================= 2. 视觉体系 (Noir UI - 保持原样) =================
+# ================= 2. 视觉体系 (Noir UI - 修改版：全白文字) =================
 
 def get_base64_image(image_path):
     if not os.path.exists(image_path):
@@ -58,29 +58,37 @@ def inject_custom_css():
             --bg-color: #050505;
             --sidebar-bg: #000000;
             --border-color: #333333;
-            --text-primary: #E0E0E0;
+            --text-primary: #FFFFFF; /* 修改：全局文字变量改为纯白 */
             --accent-error: #FF3333;
             --radius-md: 8px;
         }
 
-        .stApp, .element-container, .stMarkdown, .stDataFrame, .stButton, div[data-testid="stDataEditor"] {
+        /* 修改：增加具体标签选择器，强制文字变白 */
+        .stApp, .element-container, .stMarkdown, .stDataFrame, .stButton, div[data-testid="stDataEditor"],
+        h1, h2, h3, h4, h5, h6, p, span, div, label, li, ul, ol {
             font-family: "Microsoft YaHei", "SimHei", 'JetBrains Mono', monospace !important;
             background-color: var(--bg-color);
+            color: #FFFFFF !important; /* 强制白色 */
         }
         
-        div, input, select, textarea { border-radius: var(--radius-md) !important; }
+        /* 修改：输入框、下拉框内部文字颜色 */
+        div, input, select, textarea, .stSelectbox div[data-testid="stMarkdownContainer"] p { 
+            border-radius: var(--radius-md) !important; 
+            color: #FFFFFF !important; 
+            -webkit-text-fill-color: #FFFFFF !important; /* 兼容部分浏览器输入框 */
+        }
         
         /* 按钮样式 */
         .stButton button {
             border-radius: var(--radius-md) !important;
             border: 1px solid #333 !important;
             background: #111 !important;
-            color: #CCC !important;
+            color: #FFFFFF !important; /* 修改：按钮文字纯白 */
             transition: all 0.2s ease;
         }
         .stButton button:hover {
             border-color: #666 !important;
-            color: #FFF !important;
+            color: #FFFFFF !important;
             background: #222 !important;
         }
 
@@ -96,7 +104,7 @@ def inject_custom_css():
         }
         .nav-left { display: flex; align-items: center; gap: 12px; }
         .nav-logo-img { height: 28px; width: auto; }
-        .nav-logo-text { font-weight: 700; font-size: 18px; color: #FFF; letter-spacing: -0.5px; }
+        .nav-logo-text { font-weight: 700; font-size: 18px; color: #FFFFFF; letter-spacing: -0.5px; } /* 确保 Logo 文字白 */
         .nav-right { display: flex; align-items: center; gap: 12px; }
         .user-avatar-circle {
             width: 36px; height: 36px;
@@ -112,11 +120,15 @@ def inject_custom_css():
 
         /* 侧边栏及表格 */
         [data-testid="stSidebar"] { background-color: var(--sidebar-bg); border-right: 1px solid var(--border-color); }
+        [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3, [data-testid="stSidebar"] span, [data-testid="stSidebar"] p {
+             color: #FFFFFF !important;
+        }
         [data-testid="stDataFrame"] { background-color: #000 !important; border: 1px solid #333; border-radius: var(--radius-md); }
         
         .field-tag {
             display: inline-block; background: #111; border: 1px solid #333; 
-            color: #888; font-size: 10px; padding: 2px 6px; margin: 2px;
+            color: #FFFFFF; /* 修改：侧边栏字段标签改为白色 */
+            font-size: 10px; padding: 2px 6px; margin: 2px;
             border-radius: 4px;
         }
         
@@ -128,9 +140,10 @@ def inject_custom_css():
         .match-tag {
              padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: bold;
         }
-        .tag-high { background: rgba(0, 255, 0, 0.1); color: #00FF00; border: 1px solid #005500; }
-        .tag-med { background: rgba(255, 165, 0, 0.1); color: #FFA500; border: 1px solid #553300; }
-        .tag-low { background: rgba(255, 0, 0, 0.1); color: #FF3333; border: 1px solid #550000; }
+        /* 保留语义化颜色，但稍微提亮以配合白色主题 */
+        .tag-high { background: rgba(0, 255, 0, 0.1); color: #00FF00 !important; border: 1px solid #005500; }
+        .tag-med { background: rgba(255, 165, 0, 0.1); color: #FFA500 !important; border: 1px solid #553300; }
+        .tag-low { background: rgba(255, 0, 0, 0.1); color: #FF3333 !important; border: 1px solid #550000; }
         
         </style>
     """, unsafe_allow_html=True)
@@ -474,4 +487,3 @@ if st.session_state.uploaded_df is not None:
         # 导出
         csv = res_df.to_csv(index=False).encode('utf-8-sig')
         st.download_button("📥 下载匹配结果", csv, "match_results.csv", "text/csv")
-
