@@ -169,7 +169,7 @@ def call_ai_matching(client, target_name, target_prov, target_city, candidates_d
 
     prompt = f"""
     你是一个医疗主数据对齐专家。
-    任务：判断【待清洗数据】是否对应【候选列表】中的某家医院。
+    任务：判断【待清洗数据】是否对应【候选列表】中的某家医疗机构。
     
     【待清洗数据】
     名称: {target_name}
@@ -179,8 +179,10 @@ def call_ai_matching(client, target_name, target_prov, target_city, candidates_d
     {candidate_list_str}
     
     【规则】
-    1. 即使名称有别名差异（如“市一院” vs “第一人民医院”），只要确定是同一家，视为匹配。
-    2. 如果无法确定或列表中没有对应医院，standard_code 返回 null。
+    1. 即使名称有别名差异（如“市一院” vs “第一人民医院”），只要确定是同一家，视为匹配
+    2. 优先在主数据中同 城市，机构细分 含医院>含妇幼>含卫生院；城市找不到再扩大同 省份中 机构细分 含医院>含妇幼>含卫生院
+    3. 将待匹配医院的除 医院 外的发
+    4. 如果无法确定或列表中没有对应医院，standard_code 返回 null。
     
     【输出 JSON 格式】
     {{
@@ -485,4 +487,5 @@ else:
             st.session_state.processing = False
             st.success("AI 处理队列完成")
             st.rerun()
+
 
