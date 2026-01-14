@@ -4,6 +4,7 @@ import json
 import warnings
 import os
 import time
+import re
 from google import genai
 from google.genai import types
 
@@ -19,7 +20,7 @@ st.set_page_config(
 )
 
 # --- 模型配置 ---
-MODEL_NAME = "gemini-3-pro-preview" # 建议使用稳定或最新模型
+MODEL_NAME = "gemini-2.0-flash" # 建议使用 Flash (速度快) 或 Pro (逻辑强)
 
 # --- 主数据标准列定义 (固定) ---
 MASTER_COL_NAME = "医院名称"
@@ -139,28 +140,83 @@ def clean_json_response(text):
     except:
         return None
 
-def get_candidates_by_geo(df_master, mapping, target_prov, target_city):
-    """策略：先找同市，再找同省"""
-    candidates = pd.DataFrame()
-    # 尝试市级匹配
-    if target_city and target_city != "nan":
-        candidates = df_master[df_master[MASTER_COL_CITY] == target_city]
-    
-    # 如果市级太少，尝试省级
-    if len(candidates) == 0 and target_prov and target_prov != "nan":
-        candidates = df_master[df_master[MASTER_COL_PROV] == target_prov]
-        
-    return candidates
+# --- 新增：相似度辅助函数 ---
+def simple_tokenize(text):
+    """简单的分词（用于Jaccard计算）"""
+    if not isinstance(text, str): return set()
+    # 去除常见噪音
+    text = re.sub(r'[（(].*?[)）]', '', text)
+    text = text.replace('医院', '').replace('有限公司', '').replace('分院', '').replace('附属', '')
+    return set(text)
 
+def calculate_name_similarity(name1, name2):
+    """计算名称相似度 (Jaccard)"""
+    s1 = simple_tokenize(name1)
+    s2 = simple_tokenize(name2)
+    if not s1 or not s2: return 0.0
+    return len(s1 & s2) / len(s1 | s2)
+
+# --- 核心更新：混合候选生成策略 ---
+def get_candidates_smart(df_master, mapping, target_name, target_prov, target_city):
+    """
+    智能候选生成策略：
+    1. 【同城优先】：提取同城市的所有机构。
+    2. 【同省补充】：如果同城数据不足，提取同省中名称相似度较高的机构。
+    """
+    candidates = []
+    
+    # 1. 获取同城候选
+    df_city = pd.DataFrame()
+    if target_city and target_city != "nan":
+        df_city = df_master[df_master[MASTER_COL_CITY] == target_city].copy()
+        df_city['__source__'] = '同城' # 标记来源
+        candidates.append(df_city.head(40)) # 限制同城数量，防止过大
+
+    # 2. 获取同省候选 (仅当需要时补充，且只取名字像的)
+    current_count = len(df_city)
+    # 如果同城少于 50 条，去省里找找名字很像的 (防止城市填错)
+    if current_count < 50 and target_prov and target_prov != "nan":
+        # 排除已经是同城的
+        condition = (df_master[MASTER_COL_PROV] == target_prov)
+        if target_city:
+            condition = condition & (df_master[MASTER_COL_CITY] != target_city)
+        
+        df_prov = df_master[condition].copy()
+        
+        if not df_prov.empty:
+            # 计算相似度
+            df_prov['sim_score'] = df_prov[MASTER_COL_NAME].apply(
+                lambda x: calculate_name_similarity(str(target_name), str(x))
+            )
+            # 筛选相似度 > 0.2 的前 20 条
+            df_prov_filtered = df_prov[df_prov['sim_score'] > 0.2].sort_values(
+                by='sim_score', ascending=False
+            ).head(20)
+            
+            df_prov_filtered['__source__'] = '同省异地'
+            candidates.append(df_prov_filtered)
+            
+    if not candidates:
+        return pd.DataFrame()
+    
+    final_candidates = pd.concat(candidates)
+    # 再次按编码去重
+    final_candidates = final_candidates.drop_duplicates(subset=[MASTER_COL_CODE])
+    
+    return final_candidates
+
+# --- 核心更新：Prompt 逻辑 ---
 def call_ai_matching(client, target_name, target_prov, target_city, candidates_df):
     """调用 Gemini"""
-    # 构造候选列表 (只取前 50 条防止 Token 溢出)
+    
     candidate_list_str = ""
     candidate_map = {} 
     
-    for idx, row in candidates_df.head(400).iterrows():
+    # 构造候选列表，包含【来源】信息
+    for idx, row in candidates_df.iterrows():
         key = str(idx) 
-        info = f"ID:{key} | 名称:{row[MASTER_COL_NAME]} | 区域:{row[MASTER_COL_PROV]}-{row[MASTER_COL_CITY]}"
+        source_tag = row.get('__source__', '未知')
+        info = f"ID:{key} | 名称:{row[MASTER_COL_NAME]} | 区域:{row[MASTER_COL_PROV]}-{row[MASTER_COL_CITY]} | 来源:[{source_tag}]"
         candidate_list_str += info + "\n"
         candidate_map[key] = row
         
@@ -168,28 +224,38 @@ def call_ai_matching(client, target_name, target_prov, target_city, candidates_d
         return None 
 
     prompt = f"""
-    你是一个医疗主数据对齐专家。
-    任务：判断【待清洗数据】是否对应【候选列表】中的某家医疗机构。
+    你是一个医疗主数据对齐专家。请根据以下信息，从【候选列表】中找出与【待清洗数据】最匹配的标准机构。
     
     【待清洗数据】
     名称: {target_name}
     位置: {target_prov} - {target_city}
     
-    【候选列表】
+    【候选列表】(包含同城机构和同省名称近似机构)
     {candidate_list_str}
     
-    【规则】
-    1. 优先判断所在的地理位置，在同城市中寻找近似医疗机构
-    2. 识别待匹配机构的潜在类型 - 乡镇卫生院、社区卫生服务中心、门诊部（所）、中医医院、专科医院、妇幼保健院（所/站）、综合医院 再根据1~2个识别的潜在类型去对应的主数据范围中匹配
-    3. 即使名称有别名差异（如“市一院” vs “第一人民医院”），只要确定是同一家，视为匹配
-    4. 当在城市中找不到对应匹配时，在省份中按同样的逻辑寻找
-    5. 如果无法确定或列表中没有对应医院，standard_code 返回 null。
+    【匹配推理逻辑】
+    请严格按照以下优先级进行判断：
+    
+    1. **层级优先**：优先考虑 `来源:[同城]` 的候选。
+       - 如果在同城候选中找到名称含义一致的（包含别名、简称、曾用名），直接匹配。
+       - 例如："市一院" = "第一人民医院"。
+       
+    2. **类型识别**：
+       - 分析待清洗名称的机构类型（卫生院、服务中心、综合医院等）。
+       - 确保匹配对象的类型在逻辑上是相符的。不要将“卫生服务中心”匹配到“区人民医院”上，除非确定它们是附属关系。
+       
+    3. **跨区域修正（降级匹配）**：
+       - 仅当【同城】中完全没有合理匹配，且【同省异地】中有名称**高度相似**（几乎完全一致）的机构时，才考虑跨城市匹配。
+       - 这种情况通常是因为待清洗数据的“城市”字段填写错误。
+       
+    4. **拒绝匹配**：
+       - 如果列表中没有同一个医院，或者无法确定，请返回 null。不要强行匹配。
     
     【输出 JSON 格式】
     {{
         "matched_id": "候选列表中的ID (String)，未匹配则 null",
         "confidence": 0.0 到 1.0,
-        "reason": "简短原因"
+        "reason": "请简述推理过程"
     }}
     """
     
@@ -235,7 +301,7 @@ if "processing" not in st.session_state: st.session_state.processing = False
 if "stop_signal" not in st.session_state: st.session_state.stop_signal = False
 if "col_map" not in st.session_state: st.session_state.col_map = {}
 
-# ================= 5. 侧边栏 (改为上传主数据) =================
+# ================= 5. 侧边栏 (上传主数据) =================
 
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/3063/3063823.png", width=60)
@@ -376,8 +442,7 @@ else:
             with st.spinner("正在比对字典..."):
                 t_name = col_map['target_name']
                 
-                # --- 修复点：添加 drop_duplicates 防止重复Key报错 ---
-                # 构建纯名称哈希表 (去除首尾空格，并移除标准库中的重名行)
+                # 构建纯名称哈希表 (去除重复Key)
                 master_dict = {
                     str(k).strip(): v 
                     for k, v in df_master.drop_duplicates(subset=[MASTER_COL_NAME]).set_index(MASTER_COL_NAME).to_dict('index').items()
@@ -462,7 +527,8 @@ else:
                 status_text.markdown(f"**AI正在分析:** `{t_n}` ({t_p}-{t_c})")
                 progress_bar.progress((i + 1) / total_pending)
                 
-                candidates = get_candidates_by_geo(df_master, col_map, t_p, t_c)
+                # --- 调用新的智能候选生成策略 ---
+                candidates = get_candidates_smart(df_master, col_map, t_n, t_p, t_c)
                 
                 if len(candidates) > 0:
                     ai_res = call_ai_matching(client, t_n, t_p, t_c, candidates)
@@ -473,7 +539,7 @@ else:
                         df_curr.at[idx, '匹配状态'] = 'AI无响应'
                 else:
                     df_curr.at[idx, '匹配状态'] = '无地理候选'
-                    df_curr.at[idx, '匹配原因'] = '同省/市无主数据'
+                    df_curr.at[idx, '匹配原因'] = '同省/市无近似主数据'
 
                 if i % 5 == 0:
                     st.session_state.df_result = df_curr
@@ -488,7 +554,3 @@ else:
             st.session_state.processing = False
             st.success("AI 处理队列完成")
             st.rerun()
-
-
-
-
