@@ -6,6 +6,7 @@ import os
 import time
 import re
 import jieba
+import pickle
 from google import genai
 from google.genai import types
 
@@ -21,21 +22,21 @@ st.set_page_config(
 )
 
 # --- 模型配置 ---
-MODEL_NAME = "gemini-3-pro-preview" # 推荐 Flash (速度快) 或 Pro
+MODEL_NAME = "gemini-2.0-flash" 
 
-# --- 主数据标准列定义 (固定) ---
+# --- 全局常量 ---
 MASTER_COL_NAME = "医院名称"
 MASTER_COL_CODE = "医院编码"
 MASTER_COL_PROV = "省份"
 MASTER_COL_CITY = "城市"
+CACHE_FILE = "mdm_cache.pkl"  # 本地缓存文件路径
 
 try:
-    # 优先从 Streamlit Secrets 获取，如果没有则尝试环境变量，最后留空
     FIXED_API_KEY = st.secrets.get("GENAI_API_KEY", os.getenv("GENAI_API_KEY", ""))
 except:
     FIXED_API_KEY = "" 
 
-# ================= 2. 视觉体系 (黑金/玻璃拟态) =================
+# ================= 2. 视觉体系 =================
 
 def inject_custom_css():
     st.markdown("""
@@ -48,7 +49,6 @@ def inject_custom_css():
             font-family: 'Inter', "Microsoft YaHei", sans-serif;
         }
         
-        /* 玻璃拟态卡片 */
         .glass-card {
             background: rgba(255, 255, 255, 0.03);
             backdrop-filter: blur(10px);
@@ -58,16 +58,12 @@ def inject_custom_css():
             margin-bottom: 20px;
         }
         
-        /* 指标样式 */
         .metric-label { font-size: 12px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; }
         .metric-value { font-size: 28px; font-weight: 700; color: #ffffff; }
         .metric-sub { font-size: 12px; color: #64748b; margin-top: 4px; }
         
-        /* 侧边栏与表格 */
         [data-testid="stSidebar"] { background-color: #000000 !important; border-right: 1px solid #222; }
         [data-testid="stDataFrame"] { border: 1px solid #333; border-radius: 8px; }
-        
-        /* 进度条颜色 */
         .stProgress > div > div > div > div { background-color: #3b82f6; }
         </style>
     """, unsafe_allow_html=True)
@@ -81,9 +77,8 @@ def render_metric_card(label, value, sub_text=""):
     </div>
     """, unsafe_allow_html=True)
 
-# ================= 3. NLP 核心工具函数 =================
+# ================= 3. NLP & 数据处理工具 =================
 
-# 定义停用词：这些词在计算相似度时会被忽略，以突出核心特征
 STOP_WORDS = {
     "医院", "有限公司", "有限", "责任", "公司", "分院", "附属", 
     "学", "校", "卫生", "服务", "中心", "站", "所", "门诊", "部",
@@ -91,25 +86,14 @@ STOP_WORDS = {
 }
 
 def extract_core_tokens(text):
-    """
-    使用 jieba 分词提取核心特征词
-    输入："四川大学华西医院" -> 输出：{"四川大学", "华西"} (示例)
-    """
     if not isinstance(text, str): return set()
-    
-    # 1. 预清洗：去掉括号里的内容（通常是备注）
     text = re.sub(r'[（(].*?[)）]', '', text)
-    
-    # 2. 搜索引擎模式分词
     words = jieba.lcut_for_search(text)
-    
     tokens = set()
     for w in words:
         w = w.strip()
-        # 3. 过滤逻辑：保留非停用词，且长度>1的词（或者虽短但是数字/特定字）
         if w not in STOP_WORDS and len(w) > 1:
             tokens.add(w)
-            
     return tokens
 
 @st.cache_resource
@@ -117,16 +101,37 @@ def get_client():
     if not FIXED_API_KEY: return None
     return genai.Client(api_key=FIXED_API_KEY, http_options={'api_version': 'v1beta'})
 
-@st.cache_data(ttl=3600)
-def load_master_data(uploaded_file):
-    """
-    加载并预处理标准库：
-    1. 标准化列名
-    2. 预计算分词 Tokens (关键步骤)
-    """
-    if uploaded_file is None:
-        return None, "NO_FILE"
+# --- 缓存管理函数 ---
 
+def load_cached_master():
+    """尝试从本地加载已处理好的 Pickle 文件"""
+    if os.path.exists(CACHE_FILE):
+        try:
+            df = pd.read_pickle(CACHE_FILE)
+            return df
+        except Exception as e:
+            return None
+    return None
+
+def save_master_cache(df):
+    """将处理好的 DataFrame (含 Tokens) 保存到本地"""
+    try:
+        df.to_pickle(CACHE_FILE)
+    except Exception as e:
+        st.error(f"缓存写入失败: {e}")
+
+def clear_master_cache():
+    """清除本地缓存"""
+    if os.path.exists(CACHE_FILE):
+        os.remove(CACHE_FILE)
+
+# --- 数据加载 ---
+
+def process_master_data(uploaded_file):
+    """
+    处理上传的文件：读取 -> 清洗 -> 分词
+    注意：这里不再使用 @st.cache_data，因为我们用本地文件持久化替代了内存缓存
+    """
     try:
         if uploaded_file.name.endswith('.xlsx'): 
             df = pd.read_excel(uploaded_file, engine='openpyxl')
@@ -136,11 +141,9 @@ def load_master_data(uploaded_file):
         df = df.astype(str)
         df.columns = df.columns.str.strip()
         
-        # 简单清洗 'nan'
         for col in df.columns:
             df[col] = df[col].apply(lambda x: x.strip().replace('nan', '') if x != 'nan' else '')
 
-        # 列名映射
         col_map_rename = {}
         for col in df.columns:
             if "名称" in col and "医院" in col: col_map_rename[col] = MASTER_COL_NAME
@@ -155,8 +158,7 @@ def load_master_data(uploaded_file):
         if not all(col in df.columns for col in required):
             return None, f"缺少必要列: {required}"
         
-        # === 核心优化：预计算 Token ===
-        # 将标准名称转为 Set，存储在内存中，大幅加速后续检索
+        # 构建索引
         with st.spinner("正在构建搜索引擎索引..."):
             df['tokens'] = df[MASTER_COL_NAME].apply(extract_core_tokens)
             
@@ -175,15 +177,9 @@ def clean_json_response(text):
 # ================= 4. 召回与匹配逻辑 =================
 
 def get_candidates_by_keywords(df_master, target_name, top_k=15):
-    """
-    基于 Jaccard 相似度的全文检索
-    解决：跨地域匹配、名称简写匹配
-    """
     target_tokens = extract_core_tokens(str(target_name))
-    if not target_tokens:
-        return pd.DataFrame()
+    if not target_tokens: return pd.DataFrame()
 
-    # Jaccard 计算函数
     def calc_score(master_tokens):
         if not master_tokens: return 0.0
         intersection = len(target_tokens & master_tokens)
@@ -191,75 +187,51 @@ def get_candidates_by_keywords(df_master, target_name, top_k=15):
         if union == 0: return 0.0
         return intersection / union
 
-    # 计算得分 (Pandas 向量化 Apply)
-    # 注意：如果 df_master > 10万行，此处需进一步优化（如倒排索引），Streamlit 场景下通常够用
     scores = df_master['tokens'].apply(calc_score)
-    
-    # 筛选有重合词且得分较高的行
-    # 阈值 0.3 意味着大约有 1/3 的特征词重合
     valid_mask = scores > 0.25 
-    if not valid_mask.any():
-        return pd.DataFrame()
+    if not valid_mask.any(): return pd.DataFrame()
         
     candidates = df_master.loc[valid_mask].copy()
     candidates['sim_score'] = scores[valid_mask]
     
-    # 取前 K 个
     candidates = candidates.sort_values('sim_score', ascending=False).head(top_k)
     candidates['__source__'] = '关键词召回(异地/模糊)'
-    
     return candidates
 
 def get_candidates_smart(df_master, mapping, target_name, target_prov, target_city):
-    """
-    混合召回策略：
-    1. 同城召回 (Geo-Fence) -> 保证地域准确性
-    2. 关键词召回 (Keyword Search) -> 保证名称准确性（容错城市填写）
-    """
     candidates_list = []
     
-    # --- 策略 A: 同城召回 ---
+    # 策略 A: 同城
     if target_city and target_city != "nan":
         df_geo = df_master[df_master[MASTER_COL_CITY] == target_city].copy()
         if not df_geo.empty:
             df_geo['__source__'] = '同城范围'
-            # 限制数量，防止 Token 溢出
             candidates_list.append(df_geo.head(30))
 
-    # --- 策略 B: 关键词召回 ---
-    # 只有当名字有实质内容时才搜
+    # 策略 B: 关键词
     if len(str(target_name)) >= 2:
         df_keyword = get_candidates_by_keywords(df_master, target_name, top_k=15)
         if not df_keyword.empty:
             candidates_list.append(df_keyword)
 
-    if not candidates_list:
-        return pd.DataFrame()
+    if not candidates_list: return pd.DataFrame()
     
-    # --- 合并与去重 ---
     final = pd.concat(candidates_list)
-    # 按编码去重，如果同一家医院既在同城又被搜出来了，保留一份
     final = final.drop_duplicates(subset=[MASTER_COL_CODE])
-    
     return final
 
 def call_ai_matching(client, target_name, target_prov, target_city, candidates_df):
-    """
-    AI 决策：基于混合候选池进行最终判断
-    """
     candidate_list_str = ""
     candidate_map = {} 
     
     for idx, row in candidates_df.iterrows():
         key = str(idx) 
         source_tag = row.get('__source__', '未知')
-        # 构造上下文
         info = f"ID:{key} | 名称:{row[MASTER_COL_NAME]} | 区域:{row[MASTER_COL_PROV]}-{row[MASTER_COL_CITY]} | 来源:[{source_tag}]"
         candidate_list_str += info + "\n"
         candidate_map[key] = row
         
-    if not candidate_list_str:
-        return None 
+    if not candidate_list_str: return None 
 
     prompt = f"""
     你是一个医疗主数据对齐专家。
@@ -274,24 +246,17 @@ def call_ai_matching(client, target_name, target_prov, target_city, candidates_d
     
     【核心推理逻辑】
     1. **识别有效信息**：待清洗数据的【城市】可能填错，但【名称】中的专有名词（如"协和"、"华西"、"省立"）通常是准确的。
-    
     2. **优先级判定**：
-       - **Case A (城市错误修正)**：如果 `来源:[关键词召回]` 中有名称**高度一致**（包含相同的核心特指词）的机构，即使城市不符，也应判定为匹配（视为用户填错地址）。
-         - 例：用户填"南京-华西医院"，候选中只有"成都-四川大学华西医院"，判定匹配。
-       - **Case B (同城常规匹配)**：在 `来源:[同城范围]` 中寻找名称含义一致的机构（包括别名、简称）。
-       
-    3. **类型一致性校验**：
-       - 严禁将"卫生室"匹配到"综合医院"。
-       - 严禁将"分院"匹配到"总院"，除非没有更好的选择且明确是从属关系。
-       
-    4. **无法确定**：
-       - 如果列表里没有合适的，返回 null。
+       - **Case A (城市错误修正)**：如果 `来源:[关键词召回]` 中有名称**高度一致**（包含相同的核心特指词）的机构，即使城市不符，也应判定为匹配。
+       - **Case B (同城常规匹配)**：在 `来源:[同城范围]` 中寻找名称含义一致的机构。
+    3. **类型一致性校验**：严禁将"卫生室"匹配到"综合医院"。
+    4. **无法确定**：返回 null。
     
     【输出 JSON 格式】
     {{
         "matched_id": "候选ID (String) 或 null",
         "confidence": 0.0-1.0,
-        "reason": "简述理由，如：'名称包含核心词xx，判定为同省异地匹配' 或 '同城全称匹配'"
+        "reason": "简述理由"
     }}
     """
     
@@ -316,49 +281,66 @@ def call_ai_matching(client, target_name, target_prov, target_city, candidates_d
                     "匹配原因": result.get('reason', 'AI推理'),
                     "匹配状态": "AI匹配"
                 }
-        
-        return {
-            "匹配原因": result.get('reason', '未在候选中找到') if result else "AI返回格式无效",
-            "匹配状态": "AI未匹配"
-        }
+        return {"匹配原因": result.get('reason', '未在候选中找到') if result else "AI返回格式无效", "匹配状态": "AI未匹配"}
             
     except Exception as e:
         return {"匹配原因": f"API异常: {str(e)}", "匹配状态": "错误"}
 
-# ================= 5. 初始化与侧边栏 =================
+# ================= 5. 初始化与侧边栏逻辑 (修改重点) =================
 
 inject_custom_css()
 client = get_client()
 
+# 初始化 Session State
 if "df_result" not in st.session_state: st.session_state.df_result = None
 if "mapping_confirmed" not in st.session_state: st.session_state.mapping_confirmed = False
 if "processing" not in st.session_state: st.session_state.processing = False
 if "stop_signal" not in st.session_state: st.session_state.stop_signal = False
 if "col_map" not in st.session_state: st.session_state.col_map = {}
+# 初始化 Master Data (尝试从缓存加载)
+if "df_master" not in st.session_state: 
+    st.session_state.df_master = load_cached_master()
 
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/3063/3063823.png", width=60)
     st.title("ChatMDM")
-    st.caption("Mixed-Strategy Edition")
+    st.caption("Auto-Cache Edition")
     st.markdown("---")
 
-    st.markdown("### 1️⃣ 准备标准库")
-    st.info("上传文件时将自动构建关键词索引")
-    master_file = st.file_uploader("上传 mdm.xlsx / .csv", type=["xlsx", "csv"], key="master_uploader")
-
-    df_master = None
-    if master_file:
-        df_master, msg = load_master_data(master_file)
-        if df_master is not None:
-            st.success(f"✅ 索引构建完成: {len(df_master):,} 条")
-        else:
-            st.error(msg)
+    st.markdown("### 1️⃣ 标准库管理")
+    
+    # 逻辑分支：有缓存 vs 无缓存
+    if st.session_state.df_master is not None:
+        st.success(f"✅ 已加载缓存标准库\n\n数据量: {len(st.session_state.df_master):,} 条")
+        
+        if st.button("🗑️ 删除缓存 / 更换文件"):
+            clear_master_cache()
+            st.session_state.df_master = None
+            st.rerun()
     else:
-        st.warning("👈 等待上传标准库")
+        st.info("首次运行请上传 mdm.xlsx")
+        master_file = st.file_uploader("上传文件 (自动建立索引缓存)", type=["xlsx", "csv"], key="master_uploader")
+
+        if master_file:
+            df_processed, msg = process_master_data(master_file)
+            if df_processed is not None:
+                st.session_state.df_master = df_processed
+                # 保存到本地缓存
+                save_master_cache(df_processed)
+                st.success("索引构建完成并已缓存！")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error(msg)
 
     st.markdown("---")
-    if st.button("🔄 重置任务", use_container_width=True):
+    
+    # 重置任务按钮 (只清空待处理数据，不删主数据)
+    if st.button("🔄 重置任务 (保留标准库)", use_container_width=True):
+        # 清除所有 session state，除了 df_master
+        saved_master = st.session_state.df_master
         st.session_state.clear()
+        st.session_state.df_master = saved_master
         st.rerun()
         
     if st.session_state.df_result is not None:
@@ -378,9 +360,12 @@ st.title("🏥 医疗主数据智能对齐系统")
 if not FIXED_API_KEY:
     st.warning("⚠️ 请配置 GENAI_API_KEY")
 
-if df_master is None:
-    st.info("👋 请先从左侧上传标准库")
+# 检查 Master Data 是否就绪
+if st.session_state.df_master is None:
+    st.info("👋 欢迎！请从左侧上传标准库以开始。系统会自动缓存文件，后续无需重复上传。")
     st.stop()
+else:
+    df_master = st.session_state.df_master # 引用赋值
 
 # --- Phase 1: 上传 ---
 if st.session_state.df_result is None:
@@ -435,7 +420,6 @@ else:
     
     col_ctrl, col_status = st.columns([1, 3])
     with col_ctrl:
-        # 精确匹配逻辑 (Hash)
         if st.button("⚡ 精确匹配 (Hash)", use_container_width=True, disabled=st.session_state.processing):
             with st.spinner("Hash 比对中..."):
                 t_name = col_map['target_name']
@@ -455,7 +439,6 @@ else:
                 st.session_state.df_result = df_curr
                 st.rerun()
 
-        # AI 匹配按钮
         if not st.session_state.processing:
             if st.button("🧠 AI 深度匹配", type="primary", use_container_width=True):
                 st.session_state.processing = True
@@ -502,7 +485,6 @@ else:
                 status_text.text(f"正在处理: {t_n}")
                 progress_bar.progress((i + 1) / len(pending_indices))
                 
-                # --- 核心调用 ---
                 candidates = get_candidates_smart(df_master, col_map, t_n, t_p, t_c)
                 
                 if len(candidates) > 0:
@@ -526,4 +508,3 @@ else:
             st.session_state.processing = False
             st.success("队列处理完毕")
             st.rerun()
-
