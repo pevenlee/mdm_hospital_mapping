@@ -22,7 +22,7 @@ st.set_page_config(
 )
 
 # --- 模型配置 ---
-MODEL_NAME = "gemini-2.0-flash" 
+MODEL_NAME = "gemini-3-pro-preview" 
 
 # --- 全局常量 ---
 MASTER_COL_NAME = "医院名称"
@@ -508,3 +508,4 @@ else:
             st.session_state.processing = False
             st.success("队列处理完毕")
             st.rerun()
+
