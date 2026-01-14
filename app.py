@@ -19,7 +19,6 @@ st.set_page_config(
 )
 
 # --- 模型配置 ---
-# 请确保您的 API Key 有权限访问此模型，否则可改回 "gemini-1.5-pro-latest"
 MODEL_NAME = "gemini-3-pro-preview" 
 
 # --- 主数据标准列定义 (固定) ---
@@ -29,7 +28,7 @@ MASTER_COL_PROV = "省份"
 MASTER_COL_CITY = "城市"
 
 # --- 文件常量 ---
-FILE_MASTER = "mdm_hospital.xlsx" 
+FILE_MASTER = "mdm_hospital.csv" 
 
 try:
     FIXED_API_KEY = st.secrets.get("GENAI_API_KEY", "")
@@ -464,4 +463,5 @@ else:
             st.session_state.processing = False
             st.success("AI 处理队列完成")
             st.rerun()
+
 
