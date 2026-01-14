@@ -10,7 +10,7 @@ from google.genai import types
 # 忽略无关警告
 warnings.filterwarnings('ignore')
 
-# ================= 1. 基础配置 (必须在最前面) =================
+# ================= 1. 基础配置 =================
 
 st.set_page_config(
     page_title="ChatMDM - 智能主数据对齐", 
@@ -19,13 +19,13 @@ st.set_page_config(
 )
 
 # --- 模型配置 ---
-MODEL_NAME = "gemini-3-pro-preview" # 建议使用稳定或最新模型
+MODEL_NAME = "gemini-2.0-flash-exp" # 建议使用稳定或最新模型
 
-# --- 路径与文件配置 ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FILE_MASTER_NAME = "mdm.xlsx"
-# 👇 补上这一行 👇
-FILE_MASTER_PATH = os.path.join(BASE_DIR, FILE_MASTER_NAME)
+# --- 主数据标准列定义 (固定) ---
+MASTER_COL_NAME = "医院名称"
+MASTER_COL_CODE = "医院编码"
+MASTER_COL_PROV = "省份"
+MASTER_COL_CITY = "城市"
 
 try:
     # 优先从 Streamlit Secrets 获取，如果没有则尝试环境变量，最后留空
@@ -67,6 +67,9 @@ def inject_custom_css():
         
         /* 进度条颜色 */
         .stProgress > div > div > div > div { background-color: #3b82f6; }
+        
+        /* 上传组件样式优化 */
+        .stFileUploader > div > small { display: none; }
         </style>
     """, unsafe_allow_html=True)
 
@@ -86,21 +89,19 @@ def get_client():
     if not FIXED_API_KEY: return None
     return genai.Client(api_key=FIXED_API_KEY, http_options={'api_version': 'v1beta'})
 
-@st.cache_data
-def load_master_data(filepath):
+@st.cache_data(ttl=3600)
+def load_master_data(uploaded_file):
     """
-    加载主数据并标准化列名
-    增加了详细的错误诊断
+    加载用户上传的主数据并标准化列名
     """
-    if not os.path.exists(filepath):
-        return None, "FILE_NOT_FOUND"
+    if uploaded_file is None:
+        return None, "NO_FILE"
 
     try:
-        if filepath.endswith('.xlsx'): 
-            # 显式指定引擎，防止 read_excel 自动判断失误
-            df = pd.read_excel(filepath, engine='openpyxl')
+        if uploaded_file.name.endswith('.xlsx'): 
+            df = pd.read_excel(uploaded_file, engine='openpyxl')
         else: 
-            df = pd.read_csv(filepath)
+            df = pd.read_csv(uploaded_file)
         
         df = df.astype(str)
         df.columns = df.columns.str.strip()
@@ -109,7 +110,7 @@ def load_master_data(filepath):
         for col in df.columns:
             df[col] = df[col].apply(lambda x: x.strip().replace('nan', '') if x != 'nan' else '')
 
-        # 尝试自动映射到标准列名 (容错处理)
+        # 尝试自动映射到标准列名
         col_map_rename = {}
         for col in df.columns:
             if "名称" in col and "医院" in col: col_map_rename[col] = MASTER_COL_NAME
@@ -123,14 +124,12 @@ def load_master_data(filepath):
         # 检查必要列
         required = [MASTER_COL_NAME, MASTER_COL_CODE]
         if not all(col in df.columns for col in required):
-            return None, f"MISSING_COLUMNS: {required}"
+            return None, f"缺少必要列: {required}，请检查表头。"
             
         return df, "SUCCESS"
 
-    except ImportError:
-        return None, "MISSING_LIBRARY" # 缺少 openpyxl
     except Exception as e:
-        return None, f"UNKNOWN_ERROR: {str(e)}"
+        return None, f"读取失败: {str(e)}"
 
 def clean_json_response(text):
     """清洗 AI 返回的 JSON 字符串"""
@@ -141,9 +140,7 @@ def clean_json_response(text):
         return None
 
 def get_candidates_by_geo(df_master, mapping, target_prov, target_city):
-    """
-    策略：先找同市，再找同省。
-    """
+    """策略：先找同市，再找同省"""
     candidates = pd.DataFrame()
     # 尝试市级匹配
     if target_city and target_city != "nan":
@@ -157,7 +154,6 @@ def get_candidates_by_geo(df_master, mapping, target_prov, target_city):
 
 def call_ai_matching(client, target_name, target_prov, target_city, candidates_df):
     """调用 Gemini"""
-    
     # 构造候选列表 (只取前 50 条防止 Token 溢出)
     candidate_list_str = ""
     candidate_map = {} 
@@ -204,7 +200,6 @@ def call_ai_matching(client, target_name, target_prov, target_city, candidates_d
         
         if result and result.get('matched_id'):
             matched_id = str(result['matched_id'])
-            # 只有当 AI 返回的 ID 在我们的 map 里才算有效
             if matched_id in candidate_map:
                 matched_row = candidate_map[matched_id]
                 return {
@@ -225,7 +220,7 @@ def call_ai_matching(client, target_name, target_prov, target_city, candidates_d
     except Exception as e:
         return {"匹配原因": f"API异常: {str(e)}", "匹配状态": "错误"}
 
-# ================= 4. 初始化与文件加载 =================
+# ================= 4. 初始化 =================
 
 inject_custom_css()
 client = get_client()
@@ -237,27 +232,29 @@ if "processing" not in st.session_state: st.session_state.processing = False
 if "stop_signal" not in st.session_state: st.session_state.stop_signal = False
 if "col_map" not in st.session_state: st.session_state.col_map = {}
 
-# --- 加载主数据 ---
-df_master, load_status = load_master_data(FILE_MASTER_PATH)
-
-# ================= 5. 侧边栏 =================
+# ================= 5. 侧边栏 (改为上传主数据) =================
 
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/3063/3063823.png", width=60)
     st.title("ChatMDM")
-    
     st.markdown("---")
-    
-    if df_master is not None:
-        st.success(f"📚 主数据就绪\n\n数据量: {len(df_master):,} 条")
-    else:
-        # 侧边栏错误提示
-        st.error("⚠️ 系统未就绪")
-        if load_status == "FILE_NOT_FOUND":
-            st.caption("未找到 mdm_hospital.xlsx")
-        elif load_status == "MISSING_LIBRARY":
-            st.caption("缺少 openpyxl 库")
 
+    # --- Step 0: 上传主数据 ---
+    st.markdown("### 1️⃣ 准备标准库")
+    st.info("请先上传您的标准字典文件 (Master Data)")
+    master_file = st.file_uploader("上传 mdm.xlsx / .csv", type=["xlsx", "csv"], key="master_uploader")
+
+    df_master = None
+    if master_file:
+        df_master, msg = load_master_data(master_file)
+        if df_master is not None:
+            st.success(f"✅ 标准库就绪: {len(df_master):,} 条")
+        else:
+            st.error(msg)
+    else:
+        st.warning("👈 等待上传标准库")
+
+    st.markdown("---")
     st.markdown("### ⚙️ 操作")
     if st.button("🔄 重置任务", use_container_width=True):
         st.session_state.clear()
@@ -284,62 +281,29 @@ with st.sidebar:
             use_container_width=True
         )
 
-# ================= 6. 错误诊断页面 (当文件加载失败时) =================
-
-if df_master is None:
-    st.title("🔧 系统自检模式")
-    
-    st.markdown("""
-    <div class="glass-card" style="border-left: 4px solid #ef4444;">
-        <h3 style="margin-top:0">❌ 主数据加载失败</h3>
-        <p>系统无法读取 <b>mdm_hospital.xlsx</b>，请根据下方诊断信息修复。</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    if load_status == "MISSING_LIBRARY":
-        st.warning("缺少必要的 Python 库。请在终端运行以下命令：")
-        st.code("pip install openpyxl", language="bash")
-        
-    elif load_status == "FILE_NOT_FOUND":
-        st.warning("未找到文件。请检查文件名和路径。")
-        
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Expected Path (期望路径):**")
-            st.code(FILE_MASTER_PATH)
-        with c2:
-            st.markdown("**Files Found (当前目录下实际存在的文件):**")
-            try:
-                files = os.listdir(BASE_DIR)
-                st.code("\n".join(files) if files else "空文件夹")
-            except Exception as e:
-                st.error(f"无法读取目录: {e}")
-                
-        st.info("💡 提示: 请确保 Excel 文件名完全一致（包括扩展名），不要放在子文件夹中。")
-    
-    else:
-        st.error(f"发生未知错误: {load_status}")
-    
-    st.stop() # 停止后续代码执行
-
-# ================= 7. 主逻辑 (正常运行) =================
+# ================= 6. 主逻辑 =================
 
 st.title("🏥 医疗主数据智能对齐系统")
 
 if not FIXED_API_KEY:
     st.warning("⚠️ 未配置 API Key，AI 智能匹配功能将不可用。请在 secrets.toml 中配置 GENAI_API_KEY。")
 
-# --- Phase 1: 上传 ---
+# 如果没有上传主数据，阻止主界面运行
+if df_master is None:
+    st.info("👋 欢迎！请从左侧侧边栏上传您的 **标准库文件 (mdm.xlsx)** 以开始工作。")
+    st.stop()
+
+# --- Phase 1: 上传待清洗数据 ---
 if st.session_state.df_result is None:
-    st.markdown("### 1. 上传待清洗数据")
-    uploaded_file = st.file_uploader("支持 Excel / CSV", type=["xlsx", "csv"])
+    st.markdown("### 2️⃣ 上传待清洗数据 (Target Data)")
+    uploaded_file = st.file_uploader("支持 Excel / CSV", type=["xlsx", "csv"], key="target_uploader")
     
     if uploaded_file and df_master is not None:
         try:
             if uploaded_file.name.endswith('.csv'):
                 df_temp = pd.read_csv(uploaded_file)
             else:
-                df_temp = pd.read_excel(uploaded_file, engine='openpyxl') # 同样显式指定引擎
+                df_temp = pd.read_excel(uploaded_file, engine='openpyxl')
             
             df_temp = df_temp.astype(str)
             
@@ -355,10 +319,10 @@ if st.session_state.df_result is None:
         except Exception as e:
             st.error(f"读取上传文件失败: {e}")
 
-# --- Phase 2: 映射 (简化版) ---
+# --- Phase 2: 映射 ---
 elif not st.session_state.mapping_confirmed:
-    st.markdown("### 2. 字段映射配置")
-    st.info(f"主数据列已锁定为：[{MASTER_COL_NAME}, {MASTER_COL_CODE}, {MASTER_COL_PROV}, {MASTER_COL_CITY}]。请指定上传文件的对应列：")
+    st.markdown("### 3️⃣ 字段映射配置")
+    st.info(f"标准库列名已识别为：[{MASTER_COL_NAME}, {MASTER_COL_CODE}, {MASTER_COL_PROV}, {MASTER_COL_CITY}]。请指定待清洗文件的对应列：")
     
     df_cols = st.session_state.df_result.columns.tolist()
     
@@ -421,7 +385,6 @@ else:
                     
                     val = str(row[t_name]).strip()
                     
-                    # 纯名称 Key 匹配
                     if val in master_dict:
                         match = master_dict[val]
                         df_curr.at[idx, '标准编码'] = match.get(MASTER_COL_CODE)
@@ -481,27 +444,22 @@ else:
                 st.rerun()
             
             for i, idx in enumerate(pending_indices):
-                # 暂停检查
                 if st.session_state.stop_signal:
                     st.warning("任务已暂停")
                     st.session_state.processing = False
                     st.rerun()
                     break
                 
-                # 获取数据
                 row = df_curr.loc[idx]
                 t_n = str(row[col_map['target_name']])
                 t_p = str(row[col_map['target_province']]) if col_map['target_province'] != "无" else ""
                 t_c = str(row[col_map['target_city']]) if col_map['target_city'] != "无" else ""
                 
-                # UI 更新
                 status_text.markdown(f"**AI正在分析:** `{t_n}` ({t_p}-{t_c})")
                 progress_bar.progress((i + 1) / total_pending)
                 
-                # 1. 地理筛选
                 candidates = get_candidates_by_geo(df_master, col_map, t_p, t_c)
                 
-                # 2. API 调用
                 if len(candidates) > 0:
                     ai_res = call_ai_matching(client, t_n, t_p, t_c, candidates)
                     if ai_res:
@@ -513,7 +471,6 @@ else:
                     df_curr.at[idx, '匹配状态'] = '无地理候选'
                     df_curr.at[idx, '匹配原因'] = '同省/市无主数据'
 
-                # 3. 批量刷新 (每5条存一次，防止UI卡顿)
                 if i % 5 == 0:
                     st.session_state.df_result = df_curr
                     table_placeholder.dataframe(
@@ -523,13 +480,7 @@ else:
                         height=300
                     )
             
-            # 循环结束
             st.session_state.df_result = df_curr
             st.session_state.processing = False
             st.success("AI 处理队列完成")
             st.rerun()
-
-
-
-
-
