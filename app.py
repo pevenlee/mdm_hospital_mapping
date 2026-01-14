@@ -325,34 +325,52 @@ else:
     with ctrl_col:
         st.markdown("#### 🎮 控制台")
         
-        # 1. 全字匹配按钮
+        # 1. 全字匹配按钮 (纯名称匹配版)
         if st.button("⚡ 1. 执行精确匹配", use_container_width=True, disabled=st.session_state.processing):
-            with st.spinner("正在对比主数据字典..."):
-                m_name = col_map['master_name']
-                m_code = col_map['master_code']
-                m_prov = col_map['master_province']
-                m_city = col_map['master_city']
-                t_name = col_map['target_name']
+            with st.spinner("正在进行纯名称比对..."):
+                # 获取列映射关系
+                m_name = col_map['master_name']      # 主数据-名称列
+                m_code = col_map['master_code']      # 主数据-编码列
+                m_prov = col_map['master_province']  # 主数据-省份列
+                m_city = col_map['master_city']      # 主数据-城市列
+                t_name = col_map['target_name']      # 待清洗-名称列
                 
-                # 构建主数据字典
+                # --- 核心修改：构建纯名称索引 ---
+                # 逻辑：直接以主数据的"名称"为Key。
+                # 注意：如果主数据中有重名(如不同城市的"人民医院")，这里默认会匹配到其中一条。
+                # 既然要求"直接用名称精准匹配"，我们假设名称是唯一标识或只取第一条。
                 master_dict = df_master.set_index(m_name).to_dict('index')
                 
-                # 批量更新
+                match_count = 0
+                
+                # --- 核心修改：纯名称循环比对 ---
                 for idx, row in df_curr.iterrows():
+                    # 只处理未匹配的数据
                     if row['匹配状态'] != '待处理': continue
                     
+                    # 1. 获取上传文件中的名称 (去除首尾空格)
                     val = str(row[t_name]).strip()
+                    
+                    # 2. 直接查字典 (O(1)复杂度，极快)
                     if val in master_dict:
-                        match = master_dict[val]
-                        df_curr.at[idx, '标准编码'] = match[m_code]
-                        df_curr.at[idx, '标准名称'] = val
-                        df_curr.at[idx, '标准省份'] = match[m_prov]
-                        df_curr.at[idx, '标准城市'] = match[m_city]
+                        match_row = master_dict[val]
+                        
+                        # 3. 写入结果
+                        df_curr.at[idx, '标准编码'] = match_row[m_code]
+                        df_curr.at[idx, '标准名称'] = val # 既然完全一样，就用这个名字
+                        df_curr.at[idx, '标准省份'] = match_row[m_prov]
+                        df_curr.at[idx, '标准城市'] = match_row[m_city]
+                        
                         df_curr.at[idx, '置信度'] = 1.0
                         df_curr.at[idx, '匹配状态'] = '全字匹配'
                         df_curr.at[idx, '匹配原因'] = '名称完全一致'
+                        
+                        match_count += 1
                 
+                # 刷新状态
                 st.session_state.df_result = df_curr
+                st.success(f"精确匹配完成，命中 {match_count} 条数据")
+                time.sleep(1) # 稍作停留展示成功信息
                 st.rerun()
 
         # 2. AI 匹配按钮
@@ -450,4 +468,5 @@ else:
             st.session_state.processing = False
             st.success("本轮 AI 处理完成！")
             st.rerun()
+
 
