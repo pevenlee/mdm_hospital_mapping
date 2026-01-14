@@ -373,10 +373,11 @@ else:
             with st.spinner("正在比对字典..."):
                 t_name = col_map['target_name']
                 
-                # 构建纯名称哈希表 (去除首尾空格)
+                # --- 修复点：添加 drop_duplicates 防止重复Key报错 ---
+                # 构建纯名称哈希表 (去除首尾空格，并移除标准库中的重名行)
                 master_dict = {
                     str(k).strip(): v 
-                    for k, v in df_master.set_index(MASTER_COL_NAME).to_dict('index').items()
+                    for k, v in df_master.drop_duplicates(subset=[MASTER_COL_NAME]).set_index(MASTER_COL_NAME).to_dict('index').items()
                 }
                 
                 cnt = 0
