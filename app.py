@@ -28,7 +28,7 @@ MASTER_COL_PROV = "省份"
 MASTER_COL_CITY = "城市"
 
 # --- 文件常量 ---
-FILE_MASTER = "mdm_hospital.csv" 
+FILE_MASTER = "mdm_hospital.xlsx" 
 
 try:
     FIXED_API_KEY = st.secrets.get("GENAI_API_KEY", "")
@@ -463,5 +463,6 @@ else:
             st.session_state.processing = False
             st.success("AI 处理队列完成")
             st.rerun()
+
 
 
