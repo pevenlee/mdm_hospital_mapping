@@ -20,8 +20,7 @@ st.set_page_config(
 
 # --- 模型配置 ---
 # 注意：gemini-3-pro-preview 目前可能需要申请或特定项目权限，如果不可用请回退到 1.5-pro
-MODEL_NAME = "gemini-2-flash" # 建议在生产环境使用稳定的 Pro 版本
-# MODEL_NAME = "gemini-3-pro-preview" 
+MODEL_NAME = "gemini-3-pro-preview"
 
 # --- 常量定义 ---
 FILE_MASTER = "mdm_hospital.xlsx" 
@@ -468,5 +467,6 @@ else:
             st.session_state.processing = False
             st.success("本轮 AI 处理完成！")
             st.rerun()
+
 
 
