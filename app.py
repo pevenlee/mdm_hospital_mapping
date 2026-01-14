@@ -218,7 +218,6 @@ st.markdown(f"""
 <div class="fixed-header-container">
     <div class="nav-left">
         <div class="nav-logo-icon">{logo_html}</div>
-        <div class="nav-logo-text">ChatMDM <span style="font-size:12px; opacity:0.6; font-weight:400">| Intelligent Entity Resolution</span></div>
     </div>
     <div class="nav-right">
         {user_avatar_html}
@@ -494,4 +493,5 @@ if st.session_state.uploaded_df is not None:
         # 导出
         csv = res_df.to_csv(index=False).encode('utf-8-sig')
         st.download_button("📥 下载匹配结果", csv, "match_results.csv", "text/csv")
+
 
