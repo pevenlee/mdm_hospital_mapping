@@ -432,7 +432,14 @@ if st.session_state.uploaded_df is not None:
                     
                     ai_res = safe_generate_json(client, MODEL_SMART, prompt_match)
                     
-                    if ai_res and ai_res.get('matched_code'):
+                    # ========= 修复开始 =========
+                    # 容错处理：如果 AI 返回的是列表 [{}], 取第一个元素
+                    if isinstance(ai_res, list) and len(ai_res) > 0:
+                        ai_res = ai_res[0]
+                    
+                    # 确保 ai_res 是字典后再调用 .get()
+                    if isinstance(ai_res, dict) and ai_res.get('matched_code'):
+                    # ========= 修复结束 =========
                         conf_map = {"High": 0.95, "Medium": 0.7, "Low": 0.4}
                         match_res.update({
                             "标准编码": ai_res.get('matched_code'),
@@ -487,3 +494,4 @@ if st.session_state.uploaded_df is not None:
         # 导出
         csv = res_df.to_csv(index=False).encode('utf-8-sig')
         st.download_button("📥 下载匹配结果", csv, "match_results.csv", "text/csv")
+
