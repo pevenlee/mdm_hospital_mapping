@@ -25,7 +25,7 @@ st.set_page_config(
 # 用于快速映射字段
 MODEL_FAST = "gemini-2.0-flash"        
 # 用于复杂模糊匹配 (推理能力强)
-MODEL_SMART = "gemini-3-pro-preview"  # 注意：如果你的API不支持pro-preview，这里用flash代替，或改回 gemini-1.5-pro
+MODEL_SMART = "gemini-2.0-flash"  # 注意：如果你的API不支持pro-preview，这里用flash代替，或改回 gemini-1.5-pro
 
 # --- 常量定义 (模拟主数据库) ---
 # 假设这是你的标准主数据文件，包含标准医院名称、编码、地址等
@@ -218,7 +218,7 @@ st.markdown(f"""
 <div class="fixed-header-container">
     <div class="nav-left">
         <div class="nav-logo-icon">{logo_html}</div>
-        <div class="nav-logo-text">MDM mapping<span style="font-size:12px; opacity:0.6; 
+        <div class="nav-logo-text">ChatMDM <span style="font-size:12px; opacity:0.6; font-weight:400">| Intelligent Entity Resolution</span></div>
     </div>
     <div class="nav-right">
         {user_avatar_html}
@@ -432,14 +432,7 @@ if st.session_state.uploaded_df is not None:
                     
                     ai_res = safe_generate_json(client, MODEL_SMART, prompt_match)
                     
-                    # ========= 修复开始 =========
-                    # 容错处理：如果 AI 返回的是列表 [{}], 取第一个元素
-                    if isinstance(ai_res, list) and len(ai_res) > 0:
-                        ai_res = ai_res[0]
-                    
-                    # 确保 ai_res 是字典后再调用 .get()
-                    if isinstance(ai_res, dict) and ai_res.get('matched_code'):
-                    # ========= 修复结束 =========
+                    if ai_res and ai_res.get('matched_code'):
                         conf_map = {"High": 0.95, "Medium": 0.7, "Low": 0.4}
                         match_res.update({
                             "标准编码": ai_res.get('matched_code'),
@@ -494,6 +487,3 @@ if st.session_state.uploaded_df is not None:
         # 导出
         csv = res_df.to_csv(index=False).encode('utf-8-sig')
         st.download_button("📥 下载匹配结果", csv, "match_results.csv", "text/csv")
-
-
-
