@@ -29,7 +29,7 @@ MASTER_COL_CITY = "城市"
 
 # --- 路径与文件配置 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FILE_MASTER_NAME = "mdm_hospital.xlsx"
+FILE_MASTER_NAME = "mdm.xlsx"
 FILE_MASTER_PATH = os.path.join(BASE_DIR, FILE_MASTER_NAME)
 
 try:
@@ -533,3 +533,4 @@ else:
             st.session_state.processing = False
             st.success("AI 处理队列完成")
             st.rerun()
+
