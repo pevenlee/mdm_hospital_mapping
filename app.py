@@ -22,7 +22,7 @@ st.set_page_config(
 
 # --- 模型配置 ---
 MODEL_FAST = "gemini-2.0-flash"        
-MODEL_SMART = "gemini-2.0-flash" 
+MODEL_SMART = "gemini-3-pro-preview" 
 
 # --- 常量定义 ---
 FILE_MASTER = "mdm_hospital.xlsx" 
@@ -325,7 +325,7 @@ else:
                     # 仅演示：取前5个作为 context
                     candidates = df_master.head(5).to_dict(orient='records')
 
-                prompt = f"匹配医院: {t_name}。候选: {str(candidates)[:500]}..."
+                prompt = f"你是一个医院主数据专家，在主数据中，找到上传文件对应的医院。匹配时，优先从上传文件的医院所在地理位置，去主数据中对应的地理位置寻找"
                 
                 # 真实调用 (如果有 Key)
                 if client:
@@ -363,3 +363,4 @@ else:
             "匹配状态": st.column_config.TextColumn("状态"),
         }
     )
+
