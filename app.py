@@ -21,12 +21,6 @@ st.set_page_config(
 # --- 模型配置 ---
 MODEL_NAME = "gemini-2.0-flash-exp" # 建议使用稳定或最新模型
 
-# --- 主数据标准列定义 (固定) ---
-MASTER_COL_NAME = "医院名称"
-MASTER_COL_CODE = "医院编码"
-MASTER_COL_PROV = "省份"
-MASTER_COL_CITY = "城市"
-
 # --- 路径与文件配置 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FILE_MASTER_NAME = "mdm.xlsx"
@@ -533,4 +527,5 @@ else:
             st.session_state.processing = False
             st.success("AI 处理队列完成")
             st.rerun()
+
 
