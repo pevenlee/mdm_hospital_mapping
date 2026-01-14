@@ -20,7 +20,7 @@ st.set_page_config(
 )
 
 # --- 模型配置 ---
-MODEL_NAME = "gemini-2.0-flash" # 建议使用 Flash (速度快) 或 Pro (逻辑强)
+MODEL_NAME = "gemini-3-pro-preview" # 建议使用 Flash (速度快) 或 Pro (逻辑强)
 
 # --- 主数据标准列定义 (固定) ---
 MASTER_COL_NAME = "医院名称"
@@ -554,3 +554,4 @@ else:
             st.session_state.processing = False
             st.success("AI 处理队列完成")
             st.rerun()
+
