@@ -25,11 +25,11 @@ st.set_page_config(
 # 用于快速映射字段
 MODEL_FAST = "gemini-2.0-flash"        
 # 用于复杂模糊匹配 (推理能力强)
-MODEL_SMART = "gemini-1.5-pro-preview" 
+MODEL_SMART = "gemini-3-pro-preview" 
 
 # --- 常量定义 (模拟主数据库) ---
 # 假设这是你的标准主数据文件，包含标准医院名称、编码、地址等
-FILE_MASTER = "mdmdata.xlsx" 
+FILE_MASTER = "mdm_hospital.xlsx" 
 LOGO_FILE = "logo.png"
 
 # [头像定义]
@@ -474,3 +474,4 @@ if st.session_state.uploaded_df is not None:
         # 导出
         csv = res_df.to_csv(index=False).encode('utf-8-sig')
         st.download_button("📥 下载匹配结果", csv, "match_results.csv", "text/csv")
+
