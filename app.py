@@ -19,7 +19,7 @@ st.set_page_config(
 )
 
 # --- 模型配置 ---
-MODEL_NAME = "gemini-3-pro-preview" 
+MODEL_NAME = "gemini-2.0-flash" 
 
 # --- 主数据标准列定义 (固定) ---
 MASTER_COL_NAME = "医院名称"
@@ -27,8 +27,10 @@ MASTER_COL_CODE = "医院编码"
 MASTER_COL_PROV = "省份"
 MASTER_COL_CITY = "城市"
 
-# --- 文件常量 ---
-FILE_MASTER = "mdm_hospital.xlsx" 
+# --- 文件常量 (使用绝对路径修复找不到文件的问题) ---
+# 获取当前脚本所在文件夹的绝对路径
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FILE_MASTER = os.path.join(BASE_DIR, "mdm_hospital.xlsx")
 
 try:
     FIXED_API_KEY = st.secrets.get("GENAI_API_KEY", "")
@@ -232,16 +234,15 @@ df_master = load_master_data(FILE_MASTER)
 
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/3063/3063823.png", width=60)
-    st.title("🏥 医疗主数据智能对齐系统")
-# 临时调试：打印当前寻找的路径
-st.error(f"系统正在寻找文件的绝对路径是: {FILE_MASTER}") 
-st.error(f"该路径下文件是否存在? {os.path.exists(FILE_MASTER)}")
+    st.title("ChatMDM")
+    
     st.markdown("---")
     
     if df_master is not None:
         st.success(f"📚 主数据就绪: {len(df_master):,} 条")
     else:
-        st.error(f"请放置 {FILE_MASTER}")
+        st.error(f"未找到文件: {FILE_MASTER}")
+        st.caption("请确认 mdm_hospital.xlsx 与 app.py 在同一目录")
 
     st.markdown("### ⚙️ 操作")
     if st.button("🔄 重置任务", use_container_width=True):
@@ -466,7 +467,3 @@ else:
             st.session_state.processing = False
             st.success("AI 处理队列完成")
             st.rerun()
-
-
-
-
