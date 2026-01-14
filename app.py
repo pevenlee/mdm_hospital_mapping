@@ -232,7 +232,10 @@ df_master = load_master_data(FILE_MASTER)
 
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/3063/3063823.png", width=60)
-    st.title("ChatMDM")
+    st.title("🏥 医疗主数据智能对齐系统")
+# 临时调试：打印当前寻找的路径
+st.error(f"系统正在寻找文件的绝对路径是: {FILE_MASTER}") 
+st.error(f"该路径下文件是否存在? {os.path.exists(FILE_MASTER)}")
     st.markdown("---")
     
     if df_master is not None:
@@ -463,6 +466,7 @@ else:
             st.session_state.processing = False
             st.success("AI 处理队列完成")
             st.rerun()
+
 
 
 
