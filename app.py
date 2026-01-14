@@ -158,7 +158,7 @@ def call_ai_matching(client, target_name, target_prov, target_city, candidates_d
     candidate_list_str = ""
     candidate_map = {} 
     
-    for idx, row in candidates_df.head(50).iterrows():
+    for idx, row in candidates_df.head(400).iterrows():
         key = str(idx) 
         info = f"ID:{key} | 名称:{row[MASTER_COL_NAME]} | 区域:{row[MASTER_COL_PROV]}-{row[MASTER_COL_CITY]}"
         candidate_list_str += info + "\n"
@@ -488,6 +488,7 @@ else:
             st.session_state.processing = False
             st.success("AI 处理队列完成")
             st.rerun()
+
 
 
 
