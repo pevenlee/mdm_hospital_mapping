@@ -24,6 +24,8 @@ MODEL_NAME = "gemini-3-pro-preview" # 建议使用稳定或最新模型
 # --- 路径与文件配置 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FILE_MASTER_NAME = "mdm.xlsx"
+# 👇 补上这一行 👇
+FILE_MASTER_PATH = os.path.join(BASE_DIR, FILE_MASTER_NAME)
 
 try:
     # 优先从 Streamlit Secrets 获取，如果没有则尝试环境变量，最后留空
@@ -526,6 +528,7 @@ else:
             st.session_state.processing = False
             st.success("AI 处理队列完成")
             st.rerun()
+
 
 
 
