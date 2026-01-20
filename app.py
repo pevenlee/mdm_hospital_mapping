@@ -486,17 +486,6 @@ else:
                     st.error("未配置有效的API Key")
                 else:
                     st.session_state.processing = True
-                    # 在 st.session_state.processing = True 之后
-# 1. 先在主线程（利用Pandas向量化）完成召回，不要在线程池里算
-with st.spinner("正在预处理召回数据..."):
-    # 假设我们把召回结果存入 df_curr 的一个临时列
-    df_curr['candidates'] = df_curr.apply(lambda r: get_candidates_smart(...), axis=1)
-
-# 2. 线程池只负责纯网络请求（API调用）
-def process_row_job(idx, row_data, client, candidates):
-    # 这里只写 call_ai_matching，不写其他的计算
-    ai_res = call_ai_matching(client, ..., candidates)
-    return idx, ai_res
                     st.session_state.stop_signal = False
                     st.rerun()
         else:
@@ -593,4 +582,5 @@ def process_row_job(idx, row_data, client, candidates):
                 st.warning("处理已暂停")
                 
             st.rerun()
+
 
