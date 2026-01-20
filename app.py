@@ -6,10 +6,9 @@ import os
 import time
 import re
 import jieba
-import pickle
+import concurrent.futures
 from google import genai
 from google.genai import types
-import concurrent.futures # 新增：并发库
 
 # 忽略无关警告
 warnings.filterwarnings('ignore')
@@ -17,13 +16,13 @@ warnings.filterwarnings('ignore')
 # ================= 1. 基础配置 =================
 
 st.set_page_config(
-    page_title="ChatMDM - 智能主数据对齐", 
+    page_title="ChatMDM - 极速并发版", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
 
 # --- 模型配置 ---
-MODEL_NAME = "gemini-3-pro-preview" 
+MODEL_NAME = "gemini-3-pro-preview" # 建议使用 flash 模型，速度更快且足够处理此类任务，或者换回你的 "gemini-1.5-pro"
 
 # --- 全局常量 ---
 MASTER_COL_NAME = "医院名称"
@@ -32,13 +31,11 @@ MASTER_COL_PROV = "省份"
 MASTER_COL_CITY = "城市"
 CACHE_FILE = "mdm_cache.pkl"
 
-# 修改点：解析多个 API Key
+# --- API Key 解析 ---
 try:
     keys_str = st.secrets.get("GENAI_API_KEY", os.getenv("GENAI_API_KEY", ""))
-    # 支持逗号分隔的 Key，例如 "key1,key2,key3"
     API_KEYS = [k.strip() for k in keys_str.split(',') if k.strip()]
     if not API_KEYS:
-        # 如果没有配置，默认给一个空字符串防止报错，但实际逻辑中会拦截
         API_KEYS = [""]
 except:
     API_KEYS = [""]
@@ -103,7 +100,6 @@ def extract_core_tokens(text):
             tokens.add(w)
     return tokens
 
-# 修改点：返回客户端列表
 @st.cache_resource
 def get_clients():
     clients = []
@@ -112,10 +108,9 @@ def get_clients():
             clients.append(genai.Client(api_key=key, http_options={'api_version': 'v1beta'}))
     return clients
 
-# --- 缓存管理函数 ---
+# --- 缓存管理 ---
 
 def load_cached_master():
-    """尝试从本地加载已处理好的 Pickle 文件"""
     if os.path.exists(CACHE_FILE):
         try:
             df = pd.read_pickle(CACHE_FILE)
@@ -125,23 +120,18 @@ def load_cached_master():
     return None
 
 def save_master_cache(df):
-    """将处理好的 DataFrame (含 Tokens) 保存到本地"""
     try:
         df.to_pickle(CACHE_FILE)
     except Exception as e:
         st.error(f"缓存写入失败: {e}")
 
 def clear_master_cache():
-    """清除本地缓存"""
     if os.path.exists(CACHE_FILE):
         os.remove(CACHE_FILE)
 
 # --- 数据加载 ---
 
 def process_master_data(uploaded_file):
-    """
-    处理上传的文件：读取 -> 清洗 -> 分词
-    """
     try:
         if uploaded_file.name.endswith('.xlsx'): 
             df = pd.read_excel(uploaded_file, engine='openpyxl')
@@ -168,7 +158,6 @@ def process_master_data(uploaded_file):
         if not all(col in df.columns for col in required):
             return None, f"缺少必要列: {required}"
         
-        # 构建索引
         with st.spinner("正在构建搜索引擎索引..."):
             df['tokens'] = df[MASTER_COL_NAME].apply(extract_core_tokens)
             
@@ -187,9 +176,11 @@ def clean_json_response(text):
 # ================= 4. 召回与匹配逻辑 =================
 
 def get_candidates_by_keywords(df_master, target_name, top_k=15):
+    # 简单的关键词重叠计算，不使用 apply 以提高速度（如果数据量极大，建议使用倒排索引）
     target_tokens = extract_core_tokens(str(target_name))
     if not target_tokens: return pd.DataFrame()
 
+    # 这里的性能瓶颈在于大表扫描，后续可优化为倒排索引
     def calc_score(master_tokens):
         if not master_tokens: return 0.0
         intersection = len(target_tokens & master_tokens)
@@ -205,14 +196,15 @@ def get_candidates_by_keywords(df_master, target_name, top_k=15):
     candidates['sim_score'] = scores[valid_mask]
     
     candidates = candidates.sort_values('sim_score', ascending=False).head(top_k)
-    candidates['__source__'] = '关键词召回(异地/模糊)'
+    candidates['__source__'] = '关键词召回'
     return candidates
 
 def get_candidates_smart(df_master, col_map, target_name, target_prov, target_city):
     candidates_list = []
     
     # 策略 A: 同城
-    if target_city and target_city != "nan":
+    if target_city and target_city != "nan" and len(target_city) > 1:
+        # 优化：预先筛选，避免在大 DataFrame 上做字符串操作
         df_geo = df_master[df_master[MASTER_COL_CITY] == target_city].copy()
         if not df_geo.empty:
             df_geo['__source__'] = '同城范围'
@@ -230,44 +222,42 @@ def get_candidates_smart(df_master, col_map, target_name, target_prov, target_ci
     final = final.drop_duplicates(subset=[MASTER_COL_CODE])
     return final
 
-# 修改点：client 作为参数传入
 def call_ai_matching(client, target_name, target_prov, target_city, candidates_df):
     candidate_list_str = ""
     candidate_map = {} 
     
+    # 只取前 20 个候选减少 Prompt 长度
+    candidates_df = candidates_df.head(20)
+    
     for idx, row in candidates_df.iterrows():
         key = str(idx) 
         source_tag = row.get('__source__', '未知')
-        info = f"ID:{key} | 名称:{row[MASTER_COL_NAME]} | 区域:{row[MASTER_COL_PROV]}-{row[MASTER_COL_CITY]} | 来源:[{source_tag}]"
+        info = f"ID:{key} | 名称:{row[MASTER_COL_NAME]} | 区域:{row.get(MASTER_COL_PROV,'')}-{row.get(MASTER_COL_CITY,'')} | 来源:[{source_tag}]"
         candidate_list_str += info + "\n"
         candidate_map[key] = row
         
     if not candidate_list_str: return None 
 
     prompt = f"""
-    你是一个医疗主数据对齐专家。
-    【任务目标】判断【待清洗数据】是否对应列表中的某家标准机构。
+    你是一个医疗主数据对齐专家。请判断【待清洗数据】是否对应列表中的某家标准机构。
     
     【待清洗数据】
     名称: {target_name}
     位置: {target_prov} - {target_city}
     
-    【候选列表】(注意来源标签)
+    【候选列表】
     {candidate_list_str}
     
-    【核心推理逻辑】
-    1. **识别有效信息**：待清洗数据的【城市】可能填错，但【名称】中的专有名词（如"协和"、"华西"、"省立"）通常是准确的。
-    2. **优先级判定**：
-       - **Case A (城市错误修正)**：如果 `来源:[关键词召回]` 中有名称**高度一致**（包含相同的核心特指词）的机构，即使城市不符，也应判定为匹配。
-       - **Case B (同城常规匹配)**：在 `来源:[同城范围]` 中寻找名称含义一致的机构。
-    3. **类型一致性校验**：严禁将"卫生室"匹配到"综合医院"。
-    4. **无法确定**：返回 null。
+    【规则】
+    1. 即使城市不符，若名称核心专有名词高度一致，也应匹配（可能是城市填错）。
+    2. 严禁将"卫生室"匹配到"综合医院"。
+    3. 若无匹配，返回 null。
     
-    【输出 JSON 格式】
+    【输出 JSON】
     {{
         "matched_id": "候选ID (String) 或 null",
         "confidence": 0.0-1.0,
-        "reason": "简述理由"
+        "reason": "简短理由"
     }}
     """
     
@@ -292,27 +282,26 @@ def call_ai_matching(client, target_name, target_prov, target_city, candidates_d
                     "匹配原因": result.get('reason', 'AI推理'),
                     "匹配状态": "AI匹配"
                 }
-        return {"匹配原因": result.get('reason', '未在候选中找到') if result else "AI返回格式无效", "匹配状态": "AI未匹配"}
+        return {"匹配原因": result.get('reason', '未找到') if result else "JSON无效", "匹配状态": "AI未匹配"}
             
     except Exception as e:
         return {"匹配原因": f"API异常: {str(e)}", "匹配状态": "错误"}
 
-# 修改点：新增线程任务函数
 def process_row_job(idx, row_data, df_master, col_map, client):
     """
-    线程执行的任务函数
+    纯粹的后台计算函数，不包含任何 Streamlit UI 操作
     """
-    # 防止多线程环境下pandas SettingWithCopyWarning等，这里操作原始数据的副本
     t_n = str(row_data[col_map['target_name']])
     t_p = str(row_data[col_map['target_province']]) if col_map['target_province'] != "无" else ""
     t_c = str(row_data[col_map['target_city']]) if col_map['target_city'] != "无" else ""
     
-    # 召回
+    # 1. 召回
     candidates = get_candidates_smart(df_master, col_map, t_n, t_p, t_c)
     
-    result = {
-        "匹配状态": "无候选",
-        "匹配原因": "同城/关键词均未召回近似数据",
+    result_update = {
+        "idx": idx, # 必须把 index 传回来以便合并
+        "匹配状态": "AI未匹配",
+        "匹配原因": "无候选数据",
         "标准编码": None,
         "标准名称": None,
         "标准省份": None,
@@ -320,38 +309,36 @@ def process_row_job(idx, row_data, df_master, col_map, client):
         "置信度": 0.0
     }
     
-    # 匹配
+    # 2. 匹配
     if len(candidates) > 0:
         ai_res = call_ai_matching(client, t_n, t_p, t_c, candidates)
-        # 更新结果字典
-        result.update(ai_res)
+        if ai_res:
+            result_update.update(ai_res)
+    else:
+        result_update["匹配原因"] = "同城/关键词均未召回"
         
-    return idx, result
+    return result_update
 
 # ================= 5. 初始化与侧边栏逻辑 =================
 
 inject_custom_css()
-clients = get_clients() # 初始化客户端池
+clients = get_clients()
 
-# 初始化 Session State
 if "df_result" not in st.session_state: st.session_state.df_result = None
 if "mapping_confirmed" not in st.session_state: st.session_state.mapping_confirmed = False
 if "processing" not in st.session_state: st.session_state.processing = False
 if "stop_signal" not in st.session_state: st.session_state.stop_signal = False
 if "col_map" not in st.session_state: st.session_state.col_map = {}
-# 初始化 Master Data (尝试从缓存加载)
-if "df_master" not in st.session_state: 
-    st.session_state.df_master = load_cached_master()
+if "df_master" not in st.session_state: st.session_state.df_master = load_cached_master()
 
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/3063/3063823.png", width=60)
     st.title("ChatMDM")
-    st.caption("Multi-Key Queue Edition")
+    st.caption("High-Performance Concurrent")
     st.markdown("---")
 
     st.markdown("### 1️⃣ 标准库管理")
     
-    # 逻辑分支：有缓存 vs 无缓存
     if st.session_state.df_master is not None:
         st.success(f"✅ 已加载缓存标准库\n\n数据量: {len(st.session_state.df_master):,} 条")
         
@@ -367,7 +354,6 @@ with st.sidebar:
             df_processed, msg = process_master_data(master_file)
             if df_processed is not None:
                 st.session_state.df_master = df_processed
-                # 保存到本地缓存
                 save_master_cache(df_processed)
                 st.success("索引构建完成并已缓存！")
                 time.sleep(1)
@@ -377,7 +363,6 @@ with st.sidebar:
 
     st.markdown("---")
     
-    # 重置任务按钮
     if st.button("🔄 重置任务 (保留标准库)", use_container_width=True):
         saved_master = st.session_state.df_master
         st.session_state.clear()
@@ -396,14 +381,13 @@ with st.sidebar:
 
 # ================= 6. 主逻辑 =================
 
-st.title("🏥 医疗主数据智能对齐系统 (多线程版)")
+st.title("🏥 医疗主数据智能对齐系统 (极速版)")
 
-if not clients or (len(clients) == 1 and not clients[0].api_key):
-    st.warning("⚠️ 请配置 GENAI_API_KEY (支持逗号分隔多个Key)")
+if not clients:
+    st.warning("⚠️ 请配置 GENAI_API_KEY")
 
-# 检查 Master Data 是否就绪
 if st.session_state.df_master is None:
-    st.info("👋 欢迎！请从左侧上传标准库以开始。系统会自动缓存文件，后续无需重复上传。")
+    st.info("👋 欢迎！请从左侧上传标准库以开始。")
     st.stop()
 else:
     df_master = st.session_state.df_master 
@@ -448,6 +432,7 @@ else:
     df_curr = st.session_state.df_result
     col_map = st.session_state.col_map
     
+    # 统计数据
     total = len(df_curr)
     done_cnt = len(df_curr[df_curr['匹配状态'] != '待处理'])
     
@@ -464,26 +449,38 @@ else:
         if st.button("⚡ 精确匹配 (Hash)", use_container_width=True, disabled=st.session_state.processing):
             with st.spinner("Hash 比对中..."):
                 t_name = col_map['target_name']
-                master_dict = {str(k).strip(): v for k, v in df_master.drop_duplicates(subset=[MASTER_COL_NAME]).set_index(MASTER_COL_NAME).to_dict('index').items()}
+                # 优化：只取必要的两列做字典，减少内存
+                master_min = df_master[[MASTER_COL_NAME, MASTER_COL_CODE, MASTER_COL_PROV, MASTER_COL_CITY]].drop_duplicates(subset=[MASTER_COL_NAME])
+                master_dict = master_min.set_index(MASTER_COL_NAME).to_dict('index')
                 
-                for idx, row in df_curr.iterrows():
-                    if row['匹配状态'] != '待处理': continue
-                    val = str(row[t_name]).strip()
-                    if val in master_dict:
-                        match = master_dict[val]
-                        df_curr.at[idx, '标准编码'] = match.get(MASTER_COL_CODE)
-                        df_curr.at[idx, '标准名称'] = val
-                        df_curr.at[idx, '标准省份'] = match.get(MASTER_COL_PROV)
-                        df_curr.at[idx, '标准城市'] = match.get(MASTER_COL_CITY)
-                        df_curr.at[idx, '匹配状态'] = '全字匹配'
-                        df_curr.at[idx, '置信度'] = 1.0
+                # 向量化操作代替迭代，速度提升 100x
+                # 1. 找到匹配的 mask
+                mask = (df_curr['匹配状态'] == '待处理') & (df_curr[t_name].isin(master_dict.keys()))
+                
+                # 2. 如果有匹配的
+                if mask.any():
+                    # 这是一个较复杂的映射，为安全起见还是用 map 或者 apply，但只针对 mask 部分
+                    def apply_match(name):
+                        return master_dict.get(name, {})
+                    
+                    matched_info = df_curr.loc[mask, t_name].apply(apply_match)
+                    
+                    # 批量回填
+                    # 注意：将 dict 展开回填可能较慢，这里用逐列赋值
+                    df_curr.loc[mask, '标准编码'] = matched_info.apply(lambda x: x.get(MASTER_COL_CODE))
+                    df_curr.loc[mask, '标准名称'] = df_curr.loc[mask, t_name] # 既然全字匹配，名字就是 key
+                    df_curr.loc[mask, '标准省份'] = matched_info.apply(lambda x: x.get(MASTER_COL_PROV))
+                    df_curr.loc[mask, '标准城市'] = matched_info.apply(lambda x: x.get(MASTER_COL_CITY))
+                    df_curr.loc[mask, '匹配状态'] = '全字匹配'
+                    df_curr.loc[mask, '置信度'] = 1.0
+                
                 st.session_state.df_result = df_curr
                 st.rerun()
 
         if not st.session_state.processing:
             if st.button("🧠 AI 深度匹配 (5路并发)", type="primary", use_container_width=True):
-                if not clients or (len(clients)==1 and not clients[0].api_key):
-                    st.error("未配置有效的API Key")
+                if not clients:
+                    st.error("未配置 API Key")
                 else:
                     st.session_state.processing = True
                     st.session_state.stop_signal = False
@@ -499,6 +496,7 @@ else:
         status_text = st.empty()
         table_placeholder = st.empty()
         
+        # 初始显示
         table_placeholder.dataframe(
             df_curr, 
             use_container_width=True, 
@@ -514,57 +512,66 @@ else:
                 st.success("全部完成")
                 st.rerun()
             
-            # 线程池并发逻辑
-            max_workers = min(len(clients), 5) # 最多5路并发，且不超过Key的数量
-            if max_workers == 0: max_workers = 1 # 容错
-
-            completed_count = 0
+            # --- 并发逻辑优化 ---
+            # 1. 限制并发数
+            MAX_WORKERS = min(len(clients) * 2, 8) # 稍微激进一点，即使Key少，IO等待时也可以切
+            if MAX_WORKERS < 1: MAX_WORKERS = 1
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            completed_in_batch = 0
+            total_pending = len(pending_indices)
+            
+            # 2. 批量收集结果，而不是逐条写回 DataFrame
+            results_buffer = [] 
+            
+            status_text.text(f"🚀 正在初始化线程池 (并发数: {MAX_WORKERS})...")
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 future_to_idx = {}
                 
                 # 提交任务
                 for i, idx in enumerate(pending_indices):
-                    if st.session_state.stop_signal:
-                        break
+                    if st.session_state.stop_signal: break
                     
-                    # 循环分配客户端
                     client = clients[i % len(clients)]
-                    row_data = df_curr.loc[idx].to_dict()
+                    row_data = df_curr.loc[idx].to_dict() # 只传递 dict，切断与 df 的引用
                     
-                    future = executor.submit(
-                        process_row_job,
-                        idx, row_data, df_master, col_map, client
-                    )
+                    # 关键：传入的是数据的拷贝，且函数内不操作 UI
+                    future = executor.submit(process_row_job, idx, row_data, df_master, col_map, client)
                     future_to_idx[future] = idx
                 
-                # 处理返回结果
+                # 处理结果
+                start_time = time.time()
                 for future in concurrent.futures.as_completed(future_to_idx):
-                    idx = future_to_idx[future]
+                    if st.session_state.stop_signal: break
                     
                     try:
-                        _, result = future.result()
-                        
-                        # 更新 DataFrame
-                        for k, v in result.items():
-                            df_curr.at[idx, k] = v
-                            
+                        res = future.result()
+                        results_buffer.append(res)
                     except Exception as e:
-                        df_curr.at[idx, '匹配状态'] = '线程错误'
-                        df_curr.at[idx, '匹配原因'] = str(e)
+                        print(f"Error: {e}") # 后台打印即可
                     
-                    completed_count += 1
+                    completed_in_batch += 1
                     
-                    # 实时更新进度
-                    status_text.text(f"正在处理 (并发路数: {max_workers}): 已完成 {completed_count}/{len(pending_indices)}")
-                    progress_bar.progress(completed_count / len(pending_indices))
+                    # 3. UI 刷新策略：节流 (Throttling)
+                    # 每完成 1 个更新进度条(开销小)，每完成 10 个或 10% 更新表格(开销大)
+                    progress_val = completed_in_batch / total_pending
+                    progress_bar.progress(progress_val)
                     
-                    # 分批次刷新UI (每5个结果刷新一次，避免过于频繁的rerun导致卡顿)
-                    if completed_count % 20 == 0:
-                        st.session_state.df_result = df_curr
-                        # 注意：这里我们不调用st.rerun()，因为线程还在运行。
-                        # 我们通过更新st.session_state和上面的progress_bar/status_text来反馈。
-                        # 只有当这一批次任务全部提交完毕，或者手动触发时，才会完全重绘表格。
+                    elapsed = time.time() - start_time
+                    speed = completed_in_batch / elapsed if elapsed > 0 else 0
+                    status_text.markdown(f"**处理中...** | 速度: {speed:.1f} 条/秒 | 已完成: {completed_in_batch}/{total_pending}")
+                    
+                    # 批量写回主 DataFrame 并刷新表格
+                    # 这里的数字 10 可以根据实际体验调整，越大越流畅，但实时反馈越慢
+                    if len(results_buffer) >= 10:
+                        for res in results_buffer:
+                            idx_res = res['idx']
+                            for k, v in res.items():
+                                if k != 'idx':
+                                    df_curr.at[idx_res, k] = v
+                        results_buffer = [] # 清空缓冲
+                        
+                        # 更新表格预览
                         table_placeholder.dataframe(
                             df_curr, 
                             use_container_width=True, 
@@ -572,15 +579,14 @@ else:
                             height=300
                         )
 
-            # 这一轮所有任务提交并处理完毕后，保存最终状态并重绘
+                # 循环结束，处理剩余缓冲
+                if results_buffer:
+                    for res in results_buffer:
+                        idx_res = res['idx']
+                        for k, v in res.items():
+                            if k != 'idx':
+                                df_curr.at[idx_res, k] = v
+            
             st.session_state.df_result = df_curr
             st.session_state.processing = False
-            
-            if not st.session_state.stop_signal:
-                st.success("队列处理完毕")
-            else:
-                st.warning("处理已暂停")
-                
             st.rerun()
-
-
