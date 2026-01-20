@@ -1,16 +1,3 @@
-这是修改后的完整代码。主要进行了以下核心变更以支持**多API Key队列并行调用**：
-
-1.  **API Key配置变更**：在环境变量或Secrets中，支持使用逗号分隔的多个Key（例如：`key1,key2,key3,key4,key5`）。程序会自动解析成一个Key池。
-2.  **多客户端初始化**：`get_clients()` 函数会根据Key列表初始化多个 `genai.Client` 对象。
-3.  **引入并发库**：使用了 `concurrent.futures.ThreadPoolExecutor` 来管理线程池，设置最大并发数为5。
-4.  **重构处理逻辑**：
-    *   将单行处理逻辑提取为 `process_row_job` 函数，使其可以独立在线程中运行。
-    *   在主循环中，不再是顺序等待，而是将任务提交给线程池。
-    *   **UI实时更新策略**：每当完成5个任务，就保存状态并调用 `st.rerun()`。这样既能利用多线程加速，又能保证Streamlit界面不卡死且实时刷新进度。
-
-### 完整代码
-
-```python
 import streamlit as st
 import pandas as pd
 import json
@@ -596,3 +583,4 @@ else:
                 
             st.rerun()
 ```
+
