@@ -227,7 +227,7 @@ def call_ai_matching(client, target_name, target_prov, target_city, candidates_d
     candidate_map = {} 
     
     # 只取前 20 个候选减少 Prompt 长度
-    candidates_df = candidates_df.head(20)
+    candidates_df = candidates_df.head(300)
     
     for idx, row in candidates_df.iterrows():
         key = str(idx) 
@@ -590,3 +590,4 @@ else:
             st.session_state.df_result = df_curr
             st.session_state.processing = False
             st.rerun()
+
