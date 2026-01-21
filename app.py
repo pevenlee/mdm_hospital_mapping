@@ -34,7 +34,7 @@ MASTER_COL_PROV = "省份"
 MASTER_COL_CITY = "城市"
 CACHE_FILE = "mdm_cache.pkl"
 
-BATCH_SIZE = 10       # 每批处理多少条待清洗数据
+BATCH_SIZE = 50       # 每批处理多少条待清洗数据
 CANDIDATE_LIMIT = 500 # 候选池最大容量
 MAX_RETRIES = 3       # API 重试次数
 
@@ -539,3 +539,4 @@ else:
             st.session_state.df_result = df_curr
             st.session_state.processing = False
             st.rerun()
+
