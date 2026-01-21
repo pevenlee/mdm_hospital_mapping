@@ -427,7 +427,15 @@ else:
         # A. Hash 匹配 (预处理)
         if st.button("⚡ Step 1: 精确匹配", use_container_width=True, disabled=st.session_state.processing):
             with st.spinner("Hash 碰撞中..."):
-                master_dict = st.session_state.df_master.set_index(MASTER_COL_NAME).to_dict('index')
+                # === 修复开始 ===
+                # 1. 提取必要的列，并去除重复的“医院名称”
+                # keep='first' 表示如果名字重复，保留第一条出现的（通常标准库重复项也是指向同一个编码）
+                master_deduped = st.session_state.df_master.drop_duplicates(subset=[MASTER_COL_NAME], keep='first')
+                
+                # 2. 安全地转换为字典
+                master_dict = master_deduped.set_index(MASTER_COL_NAME).to_dict('index')
+                # === 修复结束 ===
+
                 mask = (df_curr['匹配状态'] == '待处理') & (df_curr[col_map['target_name']].isin(master_dict))
                 if mask.any():
                     # 快速回填
@@ -441,6 +449,8 @@ else:
                     df_curr.loc[mask, '置信度'] = 1.0
                     st.session_state.df_result = df_curr
                     st.rerun()
+                else:
+                    st.warning("没有发现全字匹配的项目，请直接使用 AI 匹配。")
         
         # B. AI Batch 匹配
         if not st.session_state.processing:
@@ -539,4 +549,5 @@ else:
             st.session_state.df_result = df_curr
             st.session_state.processing = False
             st.rerun()
+
 
