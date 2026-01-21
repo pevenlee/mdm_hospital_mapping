@@ -24,7 +24,7 @@ st.set_page_config(
 )
 
 # --- 模型配置 ---
-# 必须使用 flash 模型，因为 Batch 模式下上下文窗口（Context Window）需求较大
+# 保持原模型名称不变
 MODEL_NAME = "gemini-3-pro-preview" 
 
 # --- 全局常量 ---
@@ -47,7 +47,7 @@ try:
 except:
     API_KEYS = [""]
 
-# ================= 2. 视觉体系 (保持不变) =================
+# ================= 2. 视觉体系 =================
 
 def inject_custom_css():
     st.markdown("""
@@ -127,22 +127,44 @@ def process_master_data(uploaded_file):
         return df, "SUCCESS"
     except Exception as e: return None, str(e)
 
+# --- 修复版 JSON 解析函数 ---
 def clean_json_response(text):
-    text = re.sub(r'^.*?```json', '', text, flags=re.DOTALL)
-    text = re.sub(r'```.*$', '', text, flags=re.DOTALL)
+    if not text: return None
     text = text.strip()
-    try: return json.loads(text)
-    except: return None
+    
+    # 策略1: 尝试直接解析
+    try:
+        return json.loads(text)
+    except:
+        pass
+
+    # 策略2: 去除 Markdown 代码块 (```json ... ```)
+    try:
+        pattern = r"```(?:json)?\s*(.*?)\s*```"
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            clean_text = match.group(1)
+            return json.loads(clean_text)
+    except:
+        pass
+
+    # 策略3: 寻找列表边界
+    try:
+        start = text.find('[')
+        end = text.rfind(']')
+        if start != -1 and end != -1:
+            return json.loads(text[start:end+1])
+    except:
+        pass
+
+    return None
 
 # ================= 4. 批量智能匹配逻辑 (Batch Logic) =================
 
 def get_batch_candidates(df_master, target_batch_df, col_map, limit=500):
     """
-    智能候选池构建：
-    1. 锁定该 Batch 所在的城市。
-    2. 如果城市数据过多，基于 Batch 中所有待清洗数据的关键词并集进行召回，确保 Top 500 包含正确答案。
+    智能候选池构建
     """
-    # 假设 Batch 内的数据都是同一个城市（调度层保证）
     first_row = target_batch_df.iloc[0]
     t_prov = str(first_row.get(col_map['target_province'], ''))
     t_city = str(first_row.get(col_map['target_city'], ''))
@@ -152,54 +174,47 @@ def get_batch_candidates(df_master, target_batch_df, col_map, limit=500):
     if t_city and len(t_city) > 1 and t_city != 'nan' and t_city != '无':
         candidates = df_master[df_master[MASTER_COL_CITY] == t_city].copy()
     
-    # 如果城市没找到，或者城市未填写，尝试用省份
     if candidates.empty and t_prov and len(t_prov) > 1 and t_prov != 'nan':
         candidates = df_master[df_master[MASTER_COL_PROV] == t_prov].copy()
         
-    # 如果还是空的（完全没填地区），或者数量太少，全库（极其罕见，暂不处理以保速度）
     if candidates.empty:
-        # 兜底：如果完全没有地区信息，使用关键词召回（针对 Batch 中每条分别召回再合并）
-        # 但为保证速度，这里返回空，由 Prompt 处理为“未找到”
         return pd.DataFrame(), "无地区匹配"
 
     # 2. 数量控制 (Smart Pruning)
     if len(candidates) > limit:
-        # 收集 Batch 中所有待查询名称的 Token 并集
         batch_tokens = set()
         for val in target_batch_df[col_map['target_name']]:
             batch_tokens.update(extract_core_tokens(str(val)))
         
-        # 计算该地区候选机构与 Token 并集的重叠度
         def calc_batch_overlap(master_tokens):
             if not master_tokens: return 0
             return len(batch_tokens & master_tokens)
             
         candidates['overlap'] = candidates['tokens'].apply(calc_batch_overlap)
-        # 取重叠度高的 + 随机补充（防止全0）
         candidates = candidates.sort_values('overlap', ascending=False).head(limit)
         
     return candidates, f"区域:{t_prov}-{t_city}"
 
 def call_ai_batch_process(clients, target_batch_df, candidates_df, col_map, batch_id):
     """
-    Batch API 调用
+    Batch API 调用 - 修复版
     """
     # 1. 构建候选池字符串
     cand_str_list = []
     cand_map = {}
     for _, row in candidates_df.iterrows():
-        rid = str(row[MASTER_COL_CODE]) # 使用标准编码作为ID
+        rid = str(row[MASTER_COL_CODE]).strip() # 强制转字符串
         name = row[MASTER_COL_NAME]
         cand_str_list.append(f"ID:{rid} | {name}")
         cand_map[rid] = row.to_dict()
     
     candidates_text = "\n".join(cand_str_list)
 
-    # 2. 构建待清洗列表字符串
+    # 2. 构建待清洗列表字符串 (强制 Index 转 String)
     targets_list = []
     for idx, row in target_batch_df.iterrows():
         t_name = str(row[col_map['target_name']])
-        targets_list.append(f"TaskID:{idx} | 待洗名称: {t_name}")
+        targets_list.append(f"TaskID:{str(idx)} | 待洗名称: {t_name}")
     
     targets_text = "\n".join(targets_list)
 
@@ -215,7 +230,7 @@ def call_ai_batch_process(clients, target_batch_df, candidates_df, col_map, batc
     
     【要求】:
     1. 返回一个JSON列表，包含所有 TaskID 的结果。
-    2. 如果名称高度相似（忽略分院、有限公司后缀等差异），则视为匹配。
+    2. 如果名称高度相似，则视为匹配。
     3. 如果在候选池中找不到匹配项，matched_id 为 null。
     4. 即使完全不匹配，也要返回该 TaskID。
     
@@ -227,12 +242,12 @@ def call_ai_batch_process(clients, target_batch_df, candidates_df, col_map, batc
     """
 
     last_error = ""
+    last_raw_resp = ""
     
     # 4. 重试循环
     for attempt in range(MAX_RETRIES):
         try:
             client = random.choice(clients)
-            # Jitter
             time.sleep(random.uniform(0.1, 0.5) + attempt) 
             
             response = client.models.generate_content(
@@ -241,18 +256,20 @@ def call_ai_batch_process(clients, target_batch_df, candidates_df, col_map, batc
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
             
+            last_raw_resp = response.text
             result_list = clean_json_response(response.text)
             
-            if isinstance(result_list, list):
-                # 解析结果
+            if isinstance(result_list, list) and len(result_list) > 0:
                 parsed_results = []
                 for res in result_list:
-                    task_id = res.get('task_id')
-                    if task_id is None: continue
-                    
+                    # 强制将 AI 返回的 ID 转为 String 以便匹配
+                    raw_task_id = res.get('task_id')
+                    if raw_task_id is None: continue
+                    task_id_str = str(raw_task_id)
+
                     matched_id = res.get('matched_id')
                     out_row = {
-                        "idx": int(task_id), # 还原回 DataFrame 的 Index
+                        "idx_key": task_id_str, # 使用专门的键存储字符串ID
                         "匹配状态": "AI未匹配",
                         "标准编码": None, "标准名称": None, 
                         "标准省份": None, "标准城市": None,
@@ -260,15 +277,17 @@ def call_ai_batch_process(clients, target_batch_df, candidates_df, col_map, batc
                         "匹配原因": res.get('reason', 'AI未找到')
                     }
                     
-                    if matched_id and str(matched_id) in cand_map:
-                        m_row = cand_map[str(matched_id)]
-                        out_row.update({
-                            "匹配状态": "AI匹配",
-                            "标准编码": m_row[MASTER_COL_CODE],
-                            "标准名称": m_row[MASTER_COL_NAME],
-                            "标准省份": m_row[MASTER_COL_PROV],
-                            "标准城市": m_row[MASTER_COL_CITY]
-                        })
+                    if matched_id:
+                        matched_id_str = str(matched_id).strip()
+                        if matched_id_str in cand_map:
+                            m_row = cand_map[matched_id_str]
+                            out_row.update({
+                                "匹配状态": "AI匹配",
+                                "标准编码": m_row[MASTER_COL_CODE],
+                                "标准名称": m_row[MASTER_COL_NAME],
+                                "标准省份": m_row[MASTER_COL_PROV],
+                                "标准城市": m_row[MASTER_COL_CITY]
+                            })
                     parsed_results.append(out_row)
                 return parsed_results
             
@@ -279,17 +298,16 @@ def call_ai_batch_process(clients, target_batch_df, candidates_df, col_map, batc
             else:
                 break
                 
-    # 如果全部失败，返回空结果，并在外部标记错误
-    return []
+    # 如果全部失败，返回错误信息
+    return [{"error": f"{last_error} | RAW: {last_raw_resp[:50]}"}]
 
 def process_batch_job(batch_data, df_master, col_map, clients):
     """
     Worker 函数：处理一个 Batch
-    batch_data: (batch_key, dataframe_slice)
     """
     (prov, city), df_batch = batch_data
     
-    # 1. 获取该地区的候选池 (500条以内)
+    # 1. 获取该地区的候选池
     candidates, source_info = get_batch_candidates(df_master, df_batch, col_map, limit=CANDIDATE_LIMIT)
     
     results = []
@@ -308,20 +326,38 @@ def process_batch_job(batch_data, df_master, col_map, clients):
     # 2. 调用 AI
     ai_results = call_ai_batch_process(clients, df_batch, candidates, col_map, f"{prov}_{city}")
     
-    # 3. 合并结果（防止 AI 漏掉某些条目）
-    # 创建一个 map 方便查找
-    ai_res_map = {r['idx']: r for r in ai_results}
+    # 检查是否发生 API 级错误
+    if len(ai_results) == 1 and "error" in ai_results[0]:
+        err_msg = ai_results[0]["error"]
+        for idx, _ in df_batch.iterrows():
+            results.append({
+                "idx": idx,
+                "匹配状态": "AI未匹配",
+                "匹配原因": f"API调用失败: {err_msg}",
+                "置信度": 0.0
+            })
+        return results
+
+    # 3. 合并结果
+    # 将结果 List 转为以 String ID 为 Key 的字典
+    ai_res_map = {r['idx_key']: r for r in ai_results if 'idx_key' in r}
     
     final_results = []
     for idx, _ in df_batch.iterrows():
-        if idx in ai_res_map:
-            final_results.append(ai_res_map[idx])
+        idx_str = str(idx) # 强制转字符串查找
+        
+        if idx_str in ai_res_map:
+            # 找到结果，移除辅助 Key，添加原始 Index
+            res_data = ai_res_map[idx_str].copy()
+            del res_data['idx_key']
+            res_data['idx'] = idx
+            final_results.append(res_data)
         else:
-            # AI 漏掉了这条（极少情况），标记为失败
+            # AI 漏掉了这条
             final_results.append({
                 "idx": idx,
                 "匹配状态": "AI未匹配",
-                "匹配原因": "AI响应遗漏",
+                "匹配原因": "AI响应遗漏(ID未返回)",
                 "置信度": 0.0
             })
             
@@ -427,14 +463,8 @@ else:
         # A. Hash 匹配 (预处理)
         if st.button("⚡ Step 1: 精确匹配", use_container_width=True, disabled=st.session_state.processing):
             with st.spinner("Hash 碰撞中..."):
-                # === 修复开始 ===
-                # 1. 提取必要的列，并去除重复的“医院名称”
-                # keep='first' 表示如果名字重复，保留第一条出现的（通常标准库重复项也是指向同一个编码）
                 master_deduped = st.session_state.df_master.drop_duplicates(subset=[MASTER_COL_NAME], keep='first')
-                
-                # 2. 安全地转换为字典
                 master_dict = master_deduped.set_index(MASTER_COL_NAME).to_dict('index')
-                # === 修复结束 ===
 
                 mask = (df_curr['匹配状态'] == '待处理') & (df_curr[col_map['target_name']].isin(master_dict))
                 if mask.any():
@@ -497,7 +527,6 @@ else:
             status_txt.text(f"生成 {total_batches} 个批次任务 (每批约 {BATCH_SIZE} 条)...")
             
             # 3. 并发执行
-            # 由于是 Batch 处理，每个 Batch 耗时较长（I/O多），Key利用率高
             MAX_WORKERS = min(len(clients) * 2, 6) # 控制在合理范围
             
             completed_batches = 0
@@ -530,7 +559,7 @@ else:
                     speed = (completed_batches * BATCH_SIZE) / elapsed if elapsed > 0 else 0
                     status_txt.markdown(f"**AI处理中...** | 地区组处理进度: {completed_batches}/{total_batches} | 估算速度: {speed:.1f} 条/秒")
                     
-                    # 批量刷新UI (每处理完 2 个 Batch 刷新一次)
+                    # 批量刷新UI
                     if len(results_buffer) >= BATCH_SIZE * 2:
                         for res in results_buffer:
                             idx = res['idx']
@@ -549,10 +578,3 @@ else:
             st.session_state.df_result = df_curr
             st.session_state.processing = False
             st.rerun()
-
-
-
-
-
-
-
