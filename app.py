@@ -9,6 +9,7 @@ import jieba
 import random
 import concurrent.futures
 import math
+import threading
 from google import genai
 from google.genai import types
 
@@ -23,8 +24,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- 模型配置 ---
-# 保持原模型名称不变
+# --- 模型配置 (保持不变) ---
 MODEL_NAME = "gemini-3-pro-preview" 
 
 # --- 全局常量 ---
@@ -35,8 +35,8 @@ MASTER_COL_CITY = "城市"
 CACHE_FILE = "mdm_cache.pkl"
 
 BATCH_SIZE = 20       # 每批处理多少条待清洗数据
-CANDIDATE_LIMIT = 500 # 候选池最大容量
-MAX_RETRIES = 3       # API 重试次数
+CANDIDATE_LIMIT = 500 # 候选池最大容量 (建议: 如果依然频发429，可酌情降至200)
+MAX_RETRIES = 3       # 基础重试次数 (针对非429错误)
 
 # --- API Key 解析 ---
 try:
@@ -86,13 +86,33 @@ def extract_core_tokens(text):
             tokens.add(w)
     return tokens
 
+# --- 改进：API Key 管理器 (解决并发冲突) ---
+class KeyManager:
+    def __init__(self, api_keys):
+        self.clients = []
+        # 初始化所有有效的 Client
+        for k in api_keys:
+            if k:
+                try:
+                    self.clients.append(genai.Client(api_key=k, http_options={'api_version': 'v1beta'}))
+                except:
+                    pass
+        self.num_keys = len(self.clients)
+        self.current_idx = 0
+        self._lock = threading.Lock() # 线程锁
+
+    def get_next_client(self):
+        if self.num_keys == 0:
+            raise ValueError("没有有效的 API Key")
+        
+        with self._lock:
+            client = self.clients[self.current_idx]
+            self.current_idx = (self.current_idx + 1) % self.num_keys
+        return client
+
 @st.cache_resource
-def get_clients():
-    clients = []
-    for key in API_KEYS:
-        if key:
-            clients.append(genai.Client(api_key=key, http_options={'api_version': 'v1beta'}))
-    return clients
+def get_key_manager():
+    return KeyManager(API_KEYS)
 
 def load_cached_master():
     if os.path.exists(CACHE_FILE):
@@ -127,49 +147,30 @@ def process_master_data(uploaded_file):
         return df, "SUCCESS"
     except Exception as e: return None, str(e)
 
-# --- 修复版 JSON 解析函数 ---
 def clean_json_response(text):
     if not text: return None
     text = text.strip()
-    
-    # 策略1: 尝试直接解析
-    try:
-        return json.loads(text)
-    except:
-        pass
-
-    # 策略2: 去除 Markdown 代码块 (```json ... ```)
+    try: return json.loads(text)
+    except: pass
     try:
         pattern = r"```(?:json)?\s*(.*?)\s*```"
         match = re.search(pattern, text, re.DOTALL)
-        if match:
-            clean_text = match.group(1)
-            return json.loads(clean_text)
-    except:
-        pass
-
-    # 策略3: 寻找列表边界
+        if match: return json.loads(match.group(1))
+    except: pass
     try:
         start = text.find('[')
         end = text.rfind(']')
-        if start != -1 and end != -1:
-            return json.loads(text[start:end+1])
-    except:
-        pass
-
+        if start != -1 and end != -1: return json.loads(text[start:end+1])
+    except: pass
     return None
 
 # ================= 4. 批量智能匹配逻辑 (Batch Logic) =================
 
 def get_batch_candidates(df_master, target_batch_df, col_map, limit=500):
-    """
-    智能候选池构建
-    """
     first_row = target_batch_df.iloc[0]
     t_prov = str(first_row.get(col_map['target_province'], ''))
     t_city = str(first_row.get(col_map['target_city'], ''))
     
-    # 1. 区域过滤
     candidates = pd.DataFrame()
     if t_city and len(t_city) > 1 and t_city != 'nan' and t_city != '无':
         candidates = df_master[df_master[MASTER_COL_CITY] == t_city].copy()
@@ -180,7 +181,6 @@ def get_batch_candidates(df_master, target_batch_df, col_map, limit=500):
     if candidates.empty:
         return pd.DataFrame(), "无地区匹配"
 
-    # 2. 数量控制 (Smart Pruning)
     if len(candidates) > limit:
         batch_tokens = set()
         for val in target_batch_df[col_map['target_name']]:
@@ -195,22 +195,20 @@ def get_batch_candidates(df_master, target_batch_df, col_map, limit=500):
         
     return candidates, f"区域:{t_prov}-{t_city}"
 
-def call_ai_batch_process(clients, target_batch_df, candidates_df, col_map, batch_id):
+def call_ai_batch_process(key_manager, target_batch_df, candidates_df, col_map, batch_id):
     """
-    Batch API 调用 - 修复版
+    Batch API 调用 - 包含 429 错误重试与 Key 轮询机制
     """
-    # 1. 构建候选池字符串
     cand_str_list = []
     cand_map = {}
     for _, row in candidates_df.iterrows():
-        rid = str(row[MASTER_COL_CODE]).strip() # 强制转字符串
+        rid = str(row[MASTER_COL_CODE]).strip()
         name = row[MASTER_COL_NAME]
         cand_str_list.append(f"ID:{rid} | {name}")
         cand_map[rid] = row.to_dict()
     
     candidates_text = "\n".join(cand_str_list)
 
-    # 2. 构建待清洗列表字符串 (强制 Index 转 String)
     targets_list = []
     for idx, row in target_batch_df.iterrows():
         t_name = str(row[col_map['target_name']])
@@ -218,7 +216,7 @@ def call_ai_batch_process(clients, target_batch_df, candidates_df, col_map, batc
     
     targets_text = "\n".join(targets_list)
 
-    # 3. Prompt
+    # --- 你的原始提示词 (保持不变) ---
     prompt = f"""
     你是一个专业的数据清洗助手。请将【待清洗列表】中的机构名称，匹配到【标准候选池】中唯一的机构。
     
@@ -244,14 +242,19 @@ def call_ai_batch_process(clients, target_batch_df, candidates_df, col_map, batc
     last_error = ""
     last_raw_resp = ""
     
-    # 4. 重试循环
-    for attempt in range(MAX_RETRIES):
+    # 针对 429 错误的重试次数
+    RETRIES_FOR_429 = 6 
+    
+    for attempt in range(RETRIES_FOR_429):
         try:
-            client = random.choice(clients)
-            time.sleep(random.uniform(0.1, 0.5) + attempt) 
+            # 使用 Key Manager 获取下一个 Key
+            client = key_manager.get_next_client()
             
+            # 为了防止瞬间并发过高，加入微小的随机等待
+            time.sleep(random.uniform(0.1, 0.3))
+
             response = client.models.generate_content(
-                model=MODEL_NAME,
+                model=MODEL_NAME, # 保持你的模型选择
                 contents=prompt,
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
@@ -262,14 +265,13 @@ def call_ai_batch_process(clients, target_batch_df, candidates_df, col_map, batc
             if isinstance(result_list, list) and len(result_list) > 0:
                 parsed_results = []
                 for res in result_list:
-                    # 强制将 AI 返回的 ID 转为 String 以便匹配
                     raw_task_id = res.get('task_id')
                     if raw_task_id is None: continue
                     task_id_str = str(raw_task_id)
 
                     matched_id = res.get('matched_id')
                     out_row = {
-                        "idx_key": task_id_str, # 使用专门的键存储字符串ID
+                        "idx_key": task_id_str,
                         "匹配状态": "AI未匹配",
                         "标准编码": None, "标准名称": None, 
                         "标准省份": None, "标准城市": None,
@@ -291,28 +293,39 @@ def call_ai_batch_process(clients, target_batch_df, candidates_df, col_map, batc
                     parsed_results.append(out_row)
                 return parsed_results
             
+            else:
+                # 结果为空，视为失败，抛出异常触发重试（除非是最后一次）
+                raise ValueError("Empty or Invalid JSON response")
+
         except Exception as e:
             last_error = str(e)
-            if "429" in last_error or "503" in last_error:
-                continue
+            
+            # 核心：处理 429 Too Many Requests
+            if "429" in last_error or "503" in last_error or "Resource exhausted" in last_error:
+                # 指数退避: 2s -> 4s -> 8s -> 16s ...
+                sleep_time = (2 ** attempt) + random.uniform(1, 3)
+                print(f"⚠️ 触发限流 ({last_error[:20]}...), 线程休眠 {sleep_time:.1f}s 后重试...")
+                time.sleep(sleep_time)
+                continue # 继续下一次循环
             else:
+                # 其他错误（如 400 Bad Request）通常不可重试，或只重试 1-2 次
+                if attempt < 2: 
+                    time.sleep(2)
+                    continue
                 break
                 
-    # 如果全部失败，返回错误信息
     return [{"error": f"{last_error} | RAW: {last_raw_resp[:50]}"}]
 
-def process_batch_job(batch_data, df_master, col_map, clients):
+def process_batch_job(batch_data, df_master, col_map, key_manager):
     """
     Worker 函数：处理一个 Batch
     """
     (prov, city), df_batch = batch_data
     
-    # 1. 获取该地区的候选池
     candidates, source_info = get_batch_candidates(df_master, df_batch, col_map, limit=CANDIDATE_LIMIT)
     
     results = []
     
-    # 如果候选池为空，直接全部标记失败
     if candidates.empty:
         for idx, _ in df_batch.iterrows():
             results.append({
@@ -323,10 +336,9 @@ def process_batch_job(batch_data, df_master, col_map, clients):
             })
         return results
 
-    # 2. 调用 AI
-    ai_results = call_ai_batch_process(clients, df_batch, candidates, col_map, f"{prov}_{city}")
+    # 调用 AI，传入 key_manager
+    ai_results = call_ai_batch_process(key_manager, df_batch, candidates, col_map, f"{prov}_{city}")
     
-    # 检查是否发生 API 级错误
     if len(ai_results) == 1 and "error" in ai_results[0]:
         err_msg = ai_results[0]["error"]
         for idx, _ in df_batch.iterrows():
@@ -338,22 +350,18 @@ def process_batch_job(batch_data, df_master, col_map, clients):
             })
         return results
 
-    # 3. 合并结果
-    # 将结果 List 转为以 String ID 为 Key 的字典
     ai_res_map = {r['idx_key']: r for r in ai_results if 'idx_key' in r}
     
     final_results = []
     for idx, _ in df_batch.iterrows():
-        idx_str = str(idx) # 强制转字符串查找
+        idx_str = str(idx) 
         
         if idx_str in ai_res_map:
-            # 找到结果，移除辅助 Key，添加原始 Index
             res_data = ai_res_map[idx_str].copy()
             del res_data['idx_key']
             res_data['idx'] = idx
             final_results.append(res_data)
         else:
-            # AI 漏掉了这条
             final_results.append({
                 "idx": idx,
                 "匹配状态": "AI未匹配",
@@ -366,7 +374,7 @@ def process_batch_job(batch_data, df_master, col_map, clients):
 # ================= 5. UI 与 主逻辑 =================
 
 inject_custom_css()
-clients = get_clients()
+key_manager = get_key_manager() # 获取 Key 管理器
 
 if "df_result" not in st.session_state: st.session_state.df_result = None
 if "mapping_confirmed" not in st.session_state: st.session_state.mapping_confirmed = False
@@ -412,7 +420,7 @@ with st.sidebar:
 
 st.title("🏥 医疗主数据清洗 (地区聚合 + Batch并发)")
 
-if not clients: st.error("❌ 未检测到 API Key，请在 Secrets 中配置 GENAI_API_KEY")
+if key_manager.num_keys == 0: st.error("❌ 未检测到 API Key，请在 Secrets 中配置 GENAI_API_KEY")
 if st.session_state.df_master is None: st.info("请先上传标准库"); st.stop()
 
 # 1. 上传待洗数据
@@ -422,7 +430,6 @@ if st.session_state.df_result is None:
         if target_file.name.endswith('.csv'): df_t = pd.read_csv(target_file)
         else: df_t = pd.read_excel(target_file)
         df_t = df_t.astype(str)
-        # 初始化结果列
         for c in ['匹配状态', '标准编码', '标准名称', '标准省份', '标准城市', '匹配原因']: df_t[c] = None
         df_t['匹配状态'] = '待处理'
         df_t['置信度'] = 0.0
@@ -434,7 +441,7 @@ elif not st.session_state.mapping_confirmed:
     cols = st.session_state.df_result.columns.tolist()
     c1, c2, c3 = st.columns(3)
     t_name = c1.selectbox("名称列", cols)
-    t_prov = c2.selectbox("省份列", cols) # 地区分组必须要有省市
+    t_prov = c2.selectbox("省份列", cols)
     t_city = c3.selectbox("城市列", cols)
     
     if st.button("🚀 开始清洗配置"):
@@ -447,7 +454,6 @@ else:
     df_curr = st.session_state.df_result
     col_map = st.session_state.col_map
     
-    # 统计面板
     done = len(df_curr[df_curr['匹配状态'] != '待处理'])
     c1, c2, c3, c4 = st.columns(4)
     render_metric_card("总进度", f"{done}/{len(df_curr)}")
@@ -460,7 +466,6 @@ else:
     col_act, col_view = st.columns([1, 4])
     
     with col_act:
-        # A. Hash 匹配 (预处理)
         if st.button("⚡ Step 1: 精确匹配", use_container_width=True, disabled=st.session_state.processing):
             with st.spinner("Hash 碰撞中..."):
                 master_deduped = st.session_state.df_master.drop_duplicates(subset=[MASTER_COL_NAME], keep='first')
@@ -468,7 +473,6 @@ else:
 
                 mask = (df_curr['匹配状态'] == '待处理') & (df_curr[col_map['target_name']].isin(master_dict))
                 if mask.any():
-                    # 快速回填
                     def _fill(n): return master_dict.get(n, {})
                     matches = df_curr.loc[mask, col_map['target_name']].apply(_fill)
                     df_curr.loc[mask, '标准编码'] = matches.apply(lambda x: x.get(MASTER_COL_CODE))
@@ -482,7 +486,6 @@ else:
                 else:
                     st.warning("没有发现全字匹配的项目，请直接使用 AI 匹配。")
         
-        # B. AI Batch 匹配
         if not st.session_state.processing:
             if st.button("🧠 Step 2: AI 聚合匹配", type="primary", use_container_width=True):
                 st.session_state.processing = True
@@ -501,7 +504,6 @@ else:
         table_ph.dataframe(df_curr.head(100), height=300, use_container_width=True)
         
         if st.session_state.processing:
-            # 1. 筛选待处理数据
             pending_df = df_curr[df_curr['匹配状态'] == '待处理'].copy()
             
             if pending_df.empty:
@@ -509,57 +511,57 @@ else:
                 st.success("所有数据已处理完毕！")
                 st.rerun()
             
-            # 2. 生成任务批次 (Batch Generation)
             status_txt.text("正在按地区聚合分组...")
             batches = []
             
-            # 按省市分组
             grouped = pending_df.groupby([col_map['target_province'], col_map['target_city']])
             
             for (prov, city), group_df in grouped:
-                # 组内再切片，每 BATCH_SIZE 条一组
                 total_in_group = len(group_df)
                 for i in range(0, total_in_group, BATCH_SIZE):
                     batch_slice = group_df.iloc[i : i + BATCH_SIZE]
                     batches.append(((prov, city), batch_slice))
             
             total_batches = len(batches)
-            status_txt.text(f"生成 {total_batches} 个批次任务 (每批约 {BATCH_SIZE} 条)...")
             
-            # 3. 并发执行
-            MAX_WORKERS = min(len(clients) * 2, 6) # 控制在合理范围
+            # --- 优化并发数 ---
+            # 策略: 多少个Key就多少并发，至少1个。避免多线程竞争同一个Key导致的429
+            MAX_WORKERS = max(1, key_manager.num_keys)
+            status_txt.markdown(f"**AI处理中...** | 可用Key: {key_manager.num_keys} | 并发线程: {MAX_WORKERS}")
             
             completed_batches = 0
             results_buffer = []
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                future_map = {
-                    executor.submit(process_batch_job, b, st.session_state.df_master, col_map, clients): i 
-                    for i, b in enumerate(batches)
-                }
+                future_map = {}
+                for i, b in enumerate(batches):
+                    # 避免瞬间提交所有任务，给API一点喘息
+                    if i < MAX_WORKERS: time.sleep(0.5)
+                    future = executor.submit(process_batch_job, b, st.session_state.df_master, col_map, key_manager)
+                    future_map[future] = i
                 
                 start_ts = time.time()
                 
                 for future in concurrent.futures.as_completed(future_map):
-                    if st.session_state.stop_signal: break
+                    if st.session_state.stop_signal:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
                     
                     try:
                         batch_res = future.result()
-                        results_buffer.extend(batch_res) # 收集结果
+                        results_buffer.extend(batch_res)
                     except Exception as e:
                         print(e)
                     
                     completed_batches += 1
                     
-                    # 更新进度条
                     p_val = completed_batches / total_batches
                     p_bar.progress(p_val)
                     
                     elapsed = time.time() - start_ts
                     speed = (completed_batches * BATCH_SIZE) / elapsed if elapsed > 0 else 0
-                    status_txt.markdown(f"**AI处理中...** | 地区组处理进度: {completed_batches}/{total_batches} | 估算速度: {speed:.1f} 条/秒")
+                    status_txt.markdown(f"**AI处理中...** | 进度: {completed_batches}/{total_batches} | 速度: {speed:.1f} 条/秒 | 自动限流保护开启")
                     
-                    # 批量刷新UI
                     if len(results_buffer) >= BATCH_SIZE * 2:
                         for res in results_buffer:
                             idx = res['idx']
@@ -568,7 +570,6 @@ else:
                         results_buffer = []
                         table_ph.dataframe(df_curr.head(50), height=300, use_container_width=True)
             
-            # 处理剩余
             if results_buffer:
                 for res in results_buffer:
                     idx = res['idx']
