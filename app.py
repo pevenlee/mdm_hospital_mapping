@@ -645,43 +645,55 @@ else:
                 st.success("地区清洗完成！请点击 Step 2 进行匹配。")
                 st.rerun()
 
-            # ====== 分支 B: 主匹配任务 ======
+            # ====== 分支 B: 主匹配任务 (修复版) ======
             elif st.session_state.current_job == "main_match":
                 pending_df = df_curr[df_curr['匹配状态'] == '待处理'].copy()
                 
                 if pending_df.empty:
                     st.session_state.processing = False
-                    st.success("所有数据已处理完毕！")
+                    st.success("所有数据已处理完毕！(没有状态为'待处理'的数据)")
                     st.rerun()
                 
-                # 动态选择分组列
+                # 1. 确定分组列 (优先使用清洗后的列)
                 if '清洗后省份' in pending_df.columns and pending_df['清洗后省份'].notna().any():
                     g_prov, g_city = '清洗后省份', '清洗后城市'
-                    status_txt.markdown("Using **Geo-Cleaned** columns for grouping...")
+                    status_txt.markdown("✅ 正在使用 **Step 1.5 清洗后的地区** 进行智能聚合...")
                 else:
                     g_prov, g_city = col_map['target_province'], col_map['target_city']
+                    status_txt.markdown("⚠️ 未检测到清洗后的地区数据，使用**原始列**进行聚合...")
                     
-                # 填充空值以防Groupby报错
-                pending_df[g_prov] = pending_df[g_prov].fillna('')
-                pending_df[g_city] = pending_df[g_city].fillna('')
+                # 2. 关键修复：填充空值并强制转为字符串，防止 groupby 丢弃数据
+                pending_df[g_prov] = pending_df[g_prov].fillna('未知省份').astype(str)
+                pending_df[g_city] = pending_df[g_city].fillna('未知城市').astype(str)
                 
+                # 3. 生成批次
                 batches = []
-                grouped = pending_df.groupby([g_prov, g_city])
+                # dropna=False 是关键，防止空地区数据被过滤
+                grouped = pending_df.groupby([g_prov, g_city], dropna=False)
                 
                 for (prov, city), group_df in grouped:
+                    # 即使地区为空，也要处理
+                    if len(group_df) == 0: continue
                     for i in range(0, len(group_df), BATCH_SIZE):
                         batches.append(((prov, city), group_df.iloc[i : i + BATCH_SIZE]))
                 
                 total_batches = len(batches)
-                status_txt.markdown(f"**AI处理中...** | 并发线程: {MAX_WORKERS} | 分组策略: {g_prov}/{g_city}")
+                
+                if total_batches == 0:
+                    st.error("❌ 生成任务批次失败！可能所有数据在分组阶段被过滤。请检查数据是否为空。")
+                    st.session_state.processing = False
+                    st.stop()
+
+                status_txt.markdown(f"**AI处理中...** | 待处理: {len(pending_df)}条 | 共 {total_batches} 个批次 | 正在启动线程...")
                 
                 completed_batches = 0
                 results_buffer = []
                 
+                # 4. 执行并发 (增加错误捕获显示)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                     future_map = {}
                     for i, b in enumerate(batches):
-                        if i < MAX_WORKERS: time.sleep(0.5)
+                        if i < MAX_WORKERS: time.sleep(0.5) # 错峰启动
                         future = executor.submit(process_batch_job, b, st.session_state.df_master, col_map, key_manager)
                         future_map[future] = i
                     
@@ -690,31 +702,41 @@ else:
                     for future in concurrent.futures.as_completed(future_map):
                         if st.session_state.stop_signal:
                             executor.shutdown(wait=False, cancel_futures=True)
+                            st.warning("任务已暂停")
                             break
                         
                         try:
                             batch_res = future.result()
-                            results_buffer.extend(batch_res)
+                            if batch_res:
+                                results_buffer.extend(batch_res)
+                            else:
+                                print("Warning: Empty batch result")
                         except Exception as e:
-                            print(e)
+                            # 关键：将后台报错显示在前台
+                            st.error(f"线程执行错误: {str(e)}")
+                            print(f"Thread Error: {e}")
                         
                         completed_batches += 1
                         
-                        p_val = completed_batches / total_batches
+                        # 更新进度条
+                        p_val = min(1.0, completed_batches / total_batches)
                         p_bar.progress(p_val)
                         
                         elapsed = time.time() - start_ts
                         speed = (completed_batches * BATCH_SIZE) / elapsed if elapsed > 0 else 0
                         status_txt.markdown(f"**AI处理中...** | 进度: {completed_batches}/{total_batches} | 速度: {speed:.1f} 条/秒")
                         
-                        if len(results_buffer) >= BATCH_SIZE * 2:
+                        # 实时回写缓存 (每满40条回写一次)
+                        if len(results_buffer) >= 40:
                             for res in results_buffer:
                                 idx = res['idx']
                                 for k, v in res.items():
                                     if k != 'idx': df_curr.at[idx, k] = v
-                            results_buffer = []
+                            results_buffer = [] # 清空缓存
+                            # 强制刷新表格视图
                             table_ph.dataframe(df_curr.head(50), height=300, use_container_width=True)
                 
+                # 处理剩余结果
                 if results_buffer:
                     for res in results_buffer:
                         idx = res['idx']
@@ -723,4 +745,6 @@ else:
                 
                 st.session_state.df_result = df_curr
                 st.session_state.processing = False
+                st.success("🎉 所有匹配任务执行完毕！")
+                time.sleep(1) # 给用户一点时间看到成功提示
                 st.rerun()
