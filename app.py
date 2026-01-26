@@ -8,7 +8,6 @@ import re
 import jieba
 import random
 import concurrent.futures
-import math
 import threading
 from google import genai
 from google.genai import types
@@ -24,7 +23,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- 模型配置 (保持不变) ---
+# --- 模型配置 ---
 MODEL_NAME = "gemini-3-pro-preview" 
 
 # --- 全局常量 ---
@@ -35,8 +34,8 @@ MASTER_COL_CITY = "城市"
 CACHE_FILE = "mdm_cache.pkl"
 
 BATCH_SIZE = 20       # 每批处理多少条待清洗数据
-CANDIDATE_LIMIT = 500 # 候选池最大容量 (建议: 如果依然频发429，可酌情降至200)
-MAX_RETRIES = 3       # 基础重试次数 (针对非429错误)
+CANDIDATE_LIMIT = 500 # 候选池最大容量
+MAX_RETRIES = 3       
 
 # --- API Key 解析 ---
 try:
@@ -86,11 +85,9 @@ def extract_core_tokens(text):
             tokens.add(w)
     return tokens
 
-# --- 改进：API Key 管理器 (解决并发冲突) ---
 class KeyManager:
     def __init__(self, api_keys):
         self.clients = []
-        # 初始化所有有效的 Client
         for k in api_keys:
             if k:
                 try:
@@ -99,7 +96,7 @@ class KeyManager:
                     pass
         self.num_keys = len(self.clients)
         self.current_idx = 0
-        self._lock = threading.Lock() # 线程锁
+        self._lock = threading.Lock()
 
     def get_next_client(self):
         if self.num_keys == 0:
@@ -164,40 +161,63 @@ def clean_json_response(text):
     except: pass
     return None
 
-# ================= 4. 批量智能匹配逻辑 (Batch Logic) =================
+# ================= 4. AI 功能函数 (Geo & Match) =================
 
-def get_batch_candidates(df_master, target_batch_df, col_map, limit=500):
-    first_row = target_batch_df.iloc[0]
-    t_prov = str(first_row.get(col_map['target_province'], ''))
-    t_city = str(first_row.get(col_map['target_city'], ''))
+def call_ai_geo_standardize(key_manager, batch_df, col_map):
+    """
+    [新增] 专门用于清洗省市的 AI 函数
+    """
+    lines = []
+    for idx, row in batch_df.iterrows():
+        name = str(row[col_map['target_name']])
+        prov = str(row[col_map['target_province']])
+        city = str(row[col_map['target_city']])
+        lines.append(f"ID:{idx} | 名称:{name} | 原省:{prov} | 原市:{city}")
     
-    candidates = pd.DataFrame()
-    if t_city and len(t_city) > 1 and t_city != 'nan' and t_city != '无':
-        candidates = df_master[df_master[MASTER_COL_CITY] == t_city].copy()
+    data_text = "\n".join(lines)
     
-    if candidates.empty and t_prov and len(t_prov) > 1 and t_prov != 'nan':
-        candidates = df_master[df_master[MASTER_COL_PROV] == t_prov].copy()
-        
-    if candidates.empty:
-        return pd.DataFrame(), "无地区匹配"
-
-    if len(candidates) > limit:
-        batch_tokens = set()
-        for val in target_batch_df[col_map['target_name']]:
-            batch_tokens.update(extract_core_tokens(str(val)))
-        
-        def calc_batch_overlap(master_tokens):
-            if not master_tokens: return 0
-            return len(batch_tokens & master_tokens)
+    prompt = f"""
+    你是一个中国行政区划专家。请根据【机构名称】和【原始省市】推断标准的【省份】和【城市】。
+    
+    【待处理数据】:
+    {data_text}
+    
+    【要求】:
+    1. 优先从"名称"中提取地名信息（例如"南京市第一医院" -> 江苏省, 南京市）。
+    2. 如果"名称"无地名，则参考"原省/原市"并修正错别字或补全全称（如"豫"->河南省）。
+    3. 省份格式：必须是全称（如"北京市"、"新疆维吾尔自治区"、"广东省"）。
+    4. 城市格式：必须是地级市全称（如"南京市"、"朝阳区"->归为"北京市"）。
+    5. 返回 JSON 列表。
+    
+    【输出示例】:
+    [
+        {{"id": "0", "std_prov": "江苏省", "std_city": "南京市"}},
+        {{"id": "1", "std_prov": "北京市", "std_city": "北京市"}}
+    ]
+    """
+    
+    for attempt in range(3):
+        try:
+            client = key_manager.get_next_client()
+            time.sleep(random.uniform(0.1, 0.3))
             
-        candidates['overlap'] = candidates['tokens'].apply(calc_batch_overlap)
-        candidates = candidates.sort_values('overlap', ascending=False).head(limit)
-        
-    return candidates, f"区域:{t_prov}-{t_city}"
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            return clean_json_response(response.text)
+        except Exception as e:
+            if "429" in str(e) or "503" in str(e):
+                time.sleep(2 ** attempt + 1)
+                continue
+            else:
+                break
+    return []
 
 def call_ai_batch_process(key_manager, target_batch_df, candidates_df, col_map, batch_id):
     """
-    Batch API 调用 - 包含 429 错误重试与 Key 轮询机制
+    主匹配 API 调用 (保留您的原始Prompt)
     """
     cand_str_list = []
     cand_map = {}
@@ -216,7 +236,7 @@ def call_ai_batch_process(key_manager, target_batch_df, candidates_df, col_map, 
     
     targets_text = "\n".join(targets_list)
 
-    # --- 你的原始提示词 (保持不变) ---
+    # --- 您的原始提示词 ---
     prompt = f"""
     你是一个专业的数据清洗助手。请将【待清洗列表】中的机构名称，匹配到【标准候选池】中唯一的机构。
     
@@ -241,20 +261,15 @@ def call_ai_batch_process(key_manager, target_batch_df, candidates_df, col_map, 
 
     last_error = ""
     last_raw_resp = ""
-    
-    # 针对 429 错误的重试次数
     RETRIES_FOR_429 = 6 
     
     for attempt in range(RETRIES_FOR_429):
         try:
-            # 使用 Key Manager 获取下一个 Key
             client = key_manager.get_next_client()
-            
-            # 为了防止瞬间并发过高，加入微小的随机等待
             time.sleep(random.uniform(0.1, 0.3))
 
             response = client.models.generate_content(
-                model=MODEL_NAME, # 保持你的模型选择
+                model=MODEL_NAME, 
                 contents=prompt,
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
@@ -292,23 +307,17 @@ def call_ai_batch_process(key_manager, target_batch_df, candidates_df, col_map, 
                             })
                     parsed_results.append(out_row)
                 return parsed_results
-            
             else:
-                # 结果为空，视为失败，抛出异常触发重试（除非是最后一次）
                 raise ValueError("Empty or Invalid JSON response")
 
         except Exception as e:
             last_error = str(e)
-            
-            # 核心：处理 429 Too Many Requests
             if "429" in last_error or "503" in last_error or "Resource exhausted" in last_error:
-                # 指数退避: 2s -> 4s -> 8s -> 16s ...
                 sleep_time = (2 ** attempt) + random.uniform(1, 3)
                 print(f"⚠️ 触发限流 ({last_error[:20]}...), 线程休眠 {sleep_time:.1f}s 后重试...")
                 time.sleep(sleep_time)
-                continue # 继续下一次循环
+                continue 
             else:
-                # 其他错误（如 400 Bad Request）通常不可重试，或只重试 1-2 次
                 if attempt < 2: 
                     time.sleep(2)
                     continue
@@ -316,9 +325,72 @@ def call_ai_batch_process(key_manager, target_batch_df, candidates_df, col_map, 
                 
     return [{"error": f"{last_error} | RAW: {last_raw_resp[:50]}"}]
 
+# ================= 5. Batch 处理逻辑 (Worker) =================
+
+def process_geo_batch_job(batch_df, col_map, key_manager):
+    """
+    [新增] 地区清洗的 Worker
+    """
+    ai_res = call_ai_geo_standardize(key_manager, batch_df, col_map)
+    results = []
+    
+    # 建立映射以防乱序
+    res_map = {str(item['id']): item for item in ai_res if 'id' in item}
+    
+    for idx, _ in batch_df.iterrows():
+        idx_str = str(idx)
+        if idx_str in res_map:
+            results.append({
+                "idx": idx,
+                "清洗后省份": res_map[idx_str].get('std_prov', ''),
+                "清洗后城市": res_map[idx_str].get('std_city', '')
+            })
+        else:
+            results.append({
+                "idx": idx,
+                "清洗后省份": '', 
+                "清洗后城市": ''
+            })
+    return results
+
+def get_batch_candidates(df_master, target_batch_df, col_map, limit=500):
+    first_row = target_batch_df.iloc[0]
+    
+    # [修改] 优先读取 AI 清洗后的列，如果不存在则回退到原始列
+    if '清洗后省份' in target_batch_df.columns and pd.notna(first_row.get('清洗后省份')) and str(first_row.get('清洗后省份')) != '':
+        t_prov = str(first_row['清洗后省份'])
+        t_city = str(first_row['清洗后城市'])
+    else:
+        t_prov = str(first_row.get(col_map['target_province'], ''))
+        t_city = str(first_row.get(col_map['target_city'], ''))
+    
+    candidates = pd.DataFrame()
+    if t_city and len(t_city) > 1 and t_city != 'nan' and t_city != '无':
+        candidates = df_master[df_master[MASTER_COL_CITY] == t_city].copy()
+    
+    if candidates.empty and t_prov and len(t_prov) > 1 and t_prov != 'nan':
+        candidates = df_master[df_master[MASTER_COL_PROV] == t_prov].copy()
+        
+    if candidates.empty:
+        return pd.DataFrame(), "无地区匹配"
+
+    if len(candidates) > limit:
+        batch_tokens = set()
+        for val in target_batch_df[col_map['target_name']]:
+            batch_tokens.update(extract_core_tokens(str(val)))
+        
+        def calc_batch_overlap(master_tokens):
+            if not master_tokens: return 0
+            return len(batch_tokens & master_tokens)
+            
+        candidates['overlap'] = candidates['tokens'].apply(calc_batch_overlap)
+        candidates = candidates.sort_values('overlap', ascending=False).head(limit)
+        
+    return candidates, f"区域:{t_prov}-{t_city}"
+
 def process_batch_job(batch_data, df_master, col_map, key_manager):
     """
-    Worker 函数：处理一个 Batch
+    主匹配的 Worker
     """
     (prov, city), df_batch = batch_data
     
@@ -336,7 +408,6 @@ def process_batch_job(batch_data, df_master, col_map, key_manager):
             })
         return results
 
-    # 调用 AI，传入 key_manager
     ai_results = call_ai_batch_process(key_manager, df_batch, candidates, col_map, f"{prov}_{city}")
     
     if len(ai_results) == 1 and "error" in ai_results[0]:
@@ -371,10 +442,10 @@ def process_batch_job(batch_data, df_master, col_map, key_manager):
             
     return final_results
 
-# ================= 5. UI 与 主逻辑 =================
+# ================= 6. UI 与 主逻辑 =================
 
 inject_custom_css()
-key_manager = get_key_manager() # 获取 Key 管理器
+key_manager = get_key_manager() 
 
 if "df_result" not in st.session_state: st.session_state.df_result = None
 if "mapping_confirmed" not in st.session_state: st.session_state.mapping_confirmed = False
@@ -382,6 +453,7 @@ if "processing" not in st.session_state: st.session_state.processing = False
 if "stop_signal" not in st.session_state: st.session_state.stop_signal = False
 if "col_map" not in st.session_state: st.session_state.col_map = {}
 if "df_master" not in st.session_state: st.session_state.df_master = load_cached_master()
+if "current_job" not in st.session_state: st.session_state.current_job = "main_match" # main_match 或 geo_clean
 
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/3063/3063823.png", width=60)
@@ -430,7 +502,9 @@ if st.session_state.df_result is None:
         if target_file.name.endswith('.csv'): df_t = pd.read_csv(target_file)
         else: df_t = pd.read_excel(target_file)
         df_t = df_t.astype(str)
-        for c in ['匹配状态', '标准编码', '标准名称', '标准省份', '标准城市', '匹配原因']: df_t[c] = None
+        # 初始化基础列
+        for c in ['匹配状态', '标准编码', '标准名称', '标准省份', '标准城市', '匹配原因', '清洗后省份', '清洗后城市']: 
+            if c not in df_t.columns: df_t[c] = None
         df_t['匹配状态'] = '待处理'
         df_t['置信度'] = 0.0
         st.session_state.df_result = df_t
@@ -486,10 +560,17 @@ else:
                 else:
                     st.warning("没有发现全字匹配的项目，请直接使用 AI 匹配。")
         
+        # [新增] Step 1.5
+        if not st.session_state.processing:
+            if st.button("🌍 Step 1.5: AI 补全地区", help="根据名称补全缺失的省市，大幅提高匹配率", use_container_width=True):
+                st.session_state.processing = True
+                st.session_state.current_job = "geo_clean"
+                st.rerun()
+
         if not st.session_state.processing:
             if st.button("🧠 Step 2: AI 聚合匹配", type="primary", use_container_width=True):
                 st.session_state.processing = True
-                st.session_state.stop_signal = False
+                st.session_state.current_job = "main_match"
                 st.rerun()
         else:
             if st.button("🛑 暂停任务", type="secondary", use_container_width=True):
@@ -501,81 +582,145 @@ else:
         p_bar = st.progress(0)
         status_txt = st.empty()
         table_ph = st.empty()
-        table_ph.dataframe(df_curr.head(100), height=300, use_container_width=True)
+        
+        # 展示列选择：如果进行了地区清洗，展示新列
+        disp_cols = [col_map['target_name'], '匹配状态', '标准名称', '置信度']
+        if '清洗后省份' in df_curr.columns:
+            disp_cols = ['清洗后省份', '清洗后城市'] + disp_cols
+        
+        table_ph.dataframe(df_curr[disp_cols].head(100), height=300, use_container_width=True)
         
         if st.session_state.processing:
-            pending_df = df_curr[df_curr['匹配状态'] == '待处理'].copy()
-            
-            if pending_df.empty:
-                st.session_state.processing = False
-                st.success("所有数据已处理完毕！")
-                st.rerun()
-            
-            status_txt.text("正在按地区聚合分组...")
-            batches = []
-            
-            grouped = pending_df.groupby([col_map['target_province'], col_map['target_city']])
-            
-            for (prov, city), group_df in grouped:
-                total_in_group = len(group_df)
-                for i in range(0, total_in_group, BATCH_SIZE):
-                    batch_slice = group_df.iloc[i : i + BATCH_SIZE]
-                    batches.append(((prov, city), batch_slice))
-            
-            total_batches = len(batches)
-            
-            # --- 优化并发数 ---
-            # 策略: 多少个Key就多少并发，至少1个。避免多线程竞争同一个Key导致的429
             MAX_WORKERS = max(1, key_manager.num_keys)
-            status_txt.markdown(f"**AI处理中...** | 可用Key: {key_manager.num_keys} | 并发线程: {MAX_WORKERS}")
             
-            completed_batches = 0
-            results_buffer = []
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                future_map = {}
-                for i, b in enumerate(batches):
-                    # 避免瞬间提交所有任务，给API一点喘息
-                    if i < MAX_WORKERS: time.sleep(0.5)
-                    future = executor.submit(process_batch_job, b, st.session_state.df_master, col_map, key_manager)
-                    future_map[future] = i
+            # ====== 分支 A: 地区清洗任务 ======
+            if st.session_state.current_job == "geo_clean":
+                if '清洗后省份' not in df_curr.columns:
+                    df_curr['清洗后省份'] = df_curr[col_map['target_province']]
+                    df_curr['清洗后城市'] = df_curr[col_map['target_city']]
                 
-                start_ts = time.time()
+                # 找出待清洗的行 (排除已全字匹配的)
+                mask = (df_curr['匹配状态'] != '全字匹配')
+                target_indices = df_curr[mask].index
                 
-                for future in concurrent.futures.as_completed(future_map):
-                    if st.session_state.stop_signal:
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        break
+                if len(target_indices) == 0:
+                    st.session_state.processing = False
+                    st.success("没有需要清洗的数据。")
+                    st.rerun()
+
+                geo_batches = []
+                temp_df = df_curr.loc[target_indices]
+                for i in range(0, len(temp_df), BATCH_SIZE):
+                    geo_batches.append(temp_df.iloc[i : i + BATCH_SIZE])
+
+                status_txt.markdown(f"**AI地区清洗中...** | 总批次: {len(geo_batches)}")
+                
+                completed = 0
+                with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    futures = {executor.submit(process_geo_batch_job, b, col_map, key_manager): b for b in geo_batches}
                     
-                    try:
-                        batch_res = future.result()
-                        results_buffer.extend(batch_res)
-                    except Exception as e:
-                        print(e)
+                    for f in concurrent.futures.as_completed(futures):
+                        if st.session_state.stop_signal: 
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            break
+                        
+                        try:
+                            results = f.result()
+                            for res in results:
+                                idx = res['idx']
+                                df_curr.at[idx, '清洗后省份'] = res['清洗后省份']
+                                df_curr.at[idx, '清洗后城市'] = res['清洗后城市']
+                        except Exception as e:
+                            print(e)
+                            
+                        completed += 1
+                        p_bar.progress(completed / len(geo_batches))
+                        status_txt.text(f"地区清洗进度: {completed}/{len(geo_batches)}")
+                        
+                        # 刷新显示
+                        table_ph.dataframe(df_curr[['清洗后省份', '清洗后城市', col_map['target_name']]].head(50), use_container_width=True)
+                
+                st.session_state.df_result = df_curr
+                st.session_state.processing = False
+                st.success("地区清洗完成！请点击 Step 2 进行匹配。")
+                st.rerun()
+
+            # ====== 分支 B: 主匹配任务 ======
+            elif st.session_state.current_job == "main_match":
+                pending_df = df_curr[df_curr['匹配状态'] == '待处理'].copy()
+                
+                if pending_df.empty:
+                    st.session_state.processing = False
+                    st.success("所有数据已处理完毕！")
+                    st.rerun()
+                
+                # 动态选择分组列
+                if '清洗后省份' in pending_df.columns and pending_df['清洗后省份'].notna().any():
+                    g_prov, g_city = '清洗后省份', '清洗后城市'
+                    status_txt.markdown("Using **Geo-Cleaned** columns for grouping...")
+                else:
+                    g_prov, g_city = col_map['target_province'], col_map['target_city']
                     
-                    completed_batches += 1
+                # 填充空值以防Groupby报错
+                pending_df[g_prov] = pending_df[g_prov].fillna('')
+                pending_df[g_city] = pending_df[g_city].fillna('')
+                
+                batches = []
+                grouped = pending_df.groupby([g_prov, g_city])
+                
+                for (prov, city), group_df in grouped:
+                    for i in range(0, len(group_df), BATCH_SIZE):
+                        batches.append(((prov, city), group_df.iloc[i : i + BATCH_SIZE]))
+                
+                total_batches = len(batches)
+                status_txt.markdown(f"**AI处理中...** | 并发线程: {MAX_WORKERS} | 分组策略: {g_prov}/{g_city}")
+                
+                completed_batches = 0
+                results_buffer = []
+                
+                with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    future_map = {}
+                    for i, b in enumerate(batches):
+                        if i < MAX_WORKERS: time.sleep(0.5)
+                        future = executor.submit(process_batch_job, b, st.session_state.df_master, col_map, key_manager)
+                        future_map[future] = i
                     
-                    p_val = completed_batches / total_batches
-                    p_bar.progress(p_val)
+                    start_ts = time.time()
                     
-                    elapsed = time.time() - start_ts
-                    speed = (completed_batches * BATCH_SIZE) / elapsed if elapsed > 0 else 0
-                    status_txt.markdown(f"**AI处理中...** | 进度: {completed_batches}/{total_batches} | 速度: {speed:.1f} 条/秒 | 自动限流保护开启")
-                    
-                    if len(results_buffer) >= BATCH_SIZE * 2:
-                        for res in results_buffer:
-                            idx = res['idx']
-                            for k, v in res.items():
-                                if k != 'idx': df_curr.at[idx, k] = v
-                        results_buffer = []
-                        table_ph.dataframe(df_curr.head(50), height=300, use_container_width=True)
-            
-            if results_buffer:
-                for res in results_buffer:
-                    idx = res['idx']
-                    for k, v in res.items():
-                        if k != 'idx': df_curr.at[idx, k] = v
-            
-            st.session_state.df_result = df_curr
-            st.session_state.processing = False
-            st.rerun()
+                    for future in concurrent.futures.as_completed(future_map):
+                        if st.session_state.stop_signal:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            break
+                        
+                        try:
+                            batch_res = future.result()
+                            results_buffer.extend(batch_res)
+                        except Exception as e:
+                            print(e)
+                        
+                        completed_batches += 1
+                        
+                        p_val = completed_batches / total_batches
+                        p_bar.progress(p_val)
+                        
+                        elapsed = time.time() - start_ts
+                        speed = (completed_batches * BATCH_SIZE) / elapsed if elapsed > 0 else 0
+                        status_txt.markdown(f"**AI处理中...** | 进度: {completed_batches}/{total_batches} | 速度: {speed:.1f} 条/秒")
+                        
+                        if len(results_buffer) >= BATCH_SIZE * 2:
+                            for res in results_buffer:
+                                idx = res['idx']
+                                for k, v in res.items():
+                                    if k != 'idx': df_curr.at[idx, k] = v
+                            results_buffer = []
+                            table_ph.dataframe(df_curr.head(50), height=300, use_container_width=True)
+                
+                if results_buffer:
+                    for res in results_buffer:
+                        idx = res['idx']
+                        for k, v in res.items():
+                            if k != 'idx': df_curr.at[idx, k] = v
+                
+                st.session_state.df_result = df_curr
+                st.session_state.processing = False
+                st.rerun()
